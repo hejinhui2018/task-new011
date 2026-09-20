@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { Alert, Booth, Orientation } from '../types';
 import type { PlannerApi } from '../state/usePlanner';
-import { alertsForBooth } from '../lib/validation';
+import { alertsForBooth, exitName } from '../lib/validation';
 
 const ORIENTATIONS: { value: Orientation; label: string }[] = [
   { value: 'north', label: '朝北' },
@@ -12,17 +12,21 @@ const ORIENTATIONS: { value: Orientation; label: string }[] = [
 
 const KIND_LABEL: Record<Alert['kind'], string> = {
   'exit-blocked': '封住出口',
+  'exit-closed': '出口被临时关闭',
   overlap: '与相邻展位重叠',
   'out-of-bounds': '超出展厅边界',
   clearance: '通道净空不足 1.5 m',
+  'single-route': '只剩一条疏散通道',
   'no-path': '接待点无法抵达出口',
 };
 
 const KIND_CLS: Record<Alert['kind'], string> = {
   'exit-blocked': 'kind-exit-blocked',
+  'exit-closed': 'kind-exit-closed',
   overlap: 'kind-overlap',
   'out-of-bounds': 'kind-out-of-bounds',
   clearance: 'kind-clearance',
+  'single-route': 'kind-single-route',
   'no-path': 'kind-no-path',
 };
 
@@ -115,9 +119,26 @@ function SelectedInspector({
   onAlertClick: (a: Alert) => void;
 }) {
   const myAlerts = alertsForBooth(planner.analysis, booth.id);
+  const dual = planner.analysis.dualPaths[booth.id];
+  const isCritical = booth.critical === true && booth.kind !== 'partition';
 
   return (
     <>
+      {booth.kind !== 'partition' && (
+        <>
+          <h4>双通道保障</h4>
+          <button
+            className={`critical-toggle ${isCritical ? 'on' : ''}`}
+            onClick={() => planner.toggleCritical(booth.id)}
+            title="标记为重点展位后，系统会寻找两条通往不同出口、除接待点外不共用网格的疏散路径"
+          >
+            <span className="ct-star">{isCritical ? '★' : '☆'}</span>
+            {isCritical ? '已标记为重点展位（双通道）' : '标记为重点展位'}
+          </button>
+          {isCritical && dual && <DualStatus dual={dual} />}
+        </>
+      )}
+
       <h4>检查状态</h4>
       {myAlerts.length === 0 ? (
         booth.kind === 'partition' ? (
@@ -226,5 +247,54 @@ function SelectedInspector({
         </button>
       </div>
     </>
+  );
+}
+
+const CAUSE_LABEL: Record<NonNullable<import('../types').DualRouteResult['cause']>, string> = {
+  'exit-closed': '出口关闭',
+  bottleneck: '空间瓶颈',
+  cutoff: '完全断路',
+};
+
+function DualStatus({ dual }: { dual: import('../types').DualRouteResult }) {
+  if (dual.status === 'dual') {
+    return (
+      <div className="dual-status dual-ok">
+        <b>✓ 双路可用</b>
+        <span>
+          主路线 → {exitName(dual.primaryExitId ?? '')}，备用路线 →{' '}
+          {exitName(dual.secondaryExitId ?? '')}；两条路线除接待点外不共用网格。
+        </span>
+      </div>
+    );
+  }
+  if (dual.status === 'single') {
+    return (
+      <div className="dual-status dual-single">
+        <b>
+          △ 仅单路
+          <span className={`cause-tag cause-${dual.cause}`}>
+            {dual.cause ? CAUSE_LABEL[dual.cause] : ''}
+          </span>
+        </b>
+        <span>
+          当前只能经{exitName(dual.reachableExitId ?? '')}疏散；
+          {dual.cause === 'exit-closed'
+            ? '另一出口已关闭，重新开放后可能恢复双通道。'
+            : '两条候选路线在接待点之外被迫共用通道网格，需消除空间瓶颈。'}
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="dual-status dual-none">
+      <b>
+        ✕ 完全不可达
+        <span className={`cause-tag cause-${dual.cause}`}>
+          {dual.cause ? CAUSE_LABEL[dual.cause] : ''}
+        </span>
+      </b>
+      <span>接待点无法抵达任何可用出口，必须立即清理疏散通道。</span>
+    </div>
   );
 }

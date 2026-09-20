@@ -1,8 +1,15 @@
 /**
- * 方案实时分析：出口封堵、越界、重叠、净空不足、接待点到出口不可达。
- * 纯函数：输入展位列表，输出告警与每个展位的疏散路径。
+ * 方案实时分析：出口封堵/关闭、越界、重叠、净空不足、接待点到出口不可达，
+ * 以及重点展位的“双通道”判定。
+ * 纯函数：输入展位列表与封控状态，输出告警、单路路径与重点展位双路结果。
  */
-import type { Alert, AnalysisResult, Booth, Point } from '../types';
+import type {
+  Alert,
+  AnalysisResult,
+  Booth,
+  Lockdown,
+  Point,
+} from '../types';
 import { CLEARANCE, EXITS } from '../constants';
 import {
   clearanceViolation,
@@ -11,7 +18,11 @@ import {
   rectOf,
   intersects,
 } from './geometry';
-import { exitBlockingBooth, findExitPath } from './pathfinding';
+import {
+  exitBlockingBooth,
+  findExitPath,
+  findTwoExitPaths,
+} from './pathfinding';
 
 export function exitName(id: string): string {
   if (id.includes('south')) return '南出口';
@@ -28,13 +39,19 @@ const AXIS_TEXT: Record<'x' | 'y', string> = {
   y: '前后间距',
 };
 
-export function analyzePlan(booths: Booth[]): AnalysisResult {
+export function analyzePlan(
+  booths: Booth[],
+  lockdown: Lockdown = { closedExits: [], zones: [] },
+): AnalysisResult {
   const alerts: Alert[] = [];
   const paths: Record<string, Point[]> = {};
+  const dualPaths: AnalysisResult['dualPaths'] = {};
   const blockedExitIds: string[] = [];
   const labelOf = new Map(booths.map((b) => [b.id, b.label]));
+  const zones = lockdown.zones ?? [];
+  const closedExitIds = lockdown.closedExits ?? [];
 
-  // 0) 出口是否被展位直接封住
+  // 0a) 出口是否被展位直接封住
   for (const exitDef of EXITS) {
     const blocker = exitBlockingBooth(booths, exitDef);
     if (blocker) {
@@ -44,8 +61,21 @@ export function analyzePlan(booths: Booth[]): AnalysisResult {
         kind: 'exit-blocked',
         boothId: blocker.id,
         message: `${exitName(exitDef.id)}被展位 ${blocker.label} 封住，疏散出口不可用`,
+        cause: 'exit-closed',
       });
     }
+  }
+
+  // 0b) 出口是否被临时关闭（全局告警，不绑定具体展位）
+  for (const exitId of closedExitIds) {
+    alerts.push({
+      id: `exit-closed:${exitId}`,
+      kind: 'exit-closed',
+      boothId: '',
+      exitId,
+      cause: 'exit-closed',
+      message: `${exitName(exitId)}已被临时封控关闭，疏散需改走其他出口`,
+    });
   }
 
   // 1) 越界
@@ -98,25 +128,92 @@ export function analyzePlan(booths: Booth[]): AnalysisResult {
     }
   }
 
-  // 3) 接待点 -> 任一出口（围挡是设施障碍，没有接待点，不参与疏散检查）
+  // 物理封堵 + 临时关闭都不可作为疏散目标
+  const unavailableExits = new Set([...blockedExitIds, ...closedExitIds]);
+
+  // 3) 接待点 -> 出口（围挡没有接待点，不参与疏散检查）
   for (const b of booths) {
     if (b.kind === 'partition') continue;
     const start = receptionPoint(b);
-    const result = findExitPath(booths, start);
+
+    if (b.critical) {
+      // —— 重点展位：双通道判定 ——
+      const dual = findTwoExitPaths(booths, start, lockdown, blockedExitIds);
+      dualPaths[b.id] = dual;
+      if (dual.status === 'dual') {
+        paths[b.id] = dual.primary;
+      } else if (dual.status === 'single') {
+        paths[b.id] = dual.primary;
+        const openCount = EXITS.filter((e) => !unavailableExits.has(e.id)).length;
+        const cause = dual.cause ?? (openCount < 2 ? 'exit-closed' : 'bottleneck');
+        alerts.push({
+          id: `single-route:${b.id}`,
+          kind: 'single-route',
+          boothId: b.id,
+          cause,
+          exitId: dual.reachableExitId,
+          message:
+            cause === 'exit-closed'
+              ? `重点展位 ${b.label} 只剩一条疏散通道（仅可达${exitName(
+                  dual.reachableExitId ?? '',
+                )}）：另一出口已关闭，关闭期间无双通道保障`
+              : `重点展位 ${b.label} 只剩一条疏散通道（通往${exitName(
+                  dual.reachableExitId ?? '',
+                )}）：两条路线在接待点之外被迫共用通道网格，存在空间瓶颈`,
+        });
+      } else {
+        paths[b.id] = [];
+        // 所有出口都不可用（关闭/封堵）归为出口关闭；仍有出口却到不了是完全断路
+        const allExitsDown = unavailableExits.size >= EXITS.length;
+        alerts.push({
+          id: `no-path:${b.id}`,
+          kind: 'no-path',
+          boothId: b.id,
+          cause: allExitsDown ? 'exit-closed' : 'cutoff',
+          message: allExitsDown
+            ? `重点展位 ${b.label} 无法疏散：全部出口均已关闭/封堵`
+            : `重点展位 ${b.label} 正面接待点无法抵达任一可用出口，疏散通道被完全堵断`,
+        });
+      }
+      continue;
+    }
+
+    // —— 普通展位：维持原单路 BFS 检查（同时尊重封控区域与关闭出口）——
+    const result = findExitPath(
+      booths,
+      start,
+      EXITS,
+      undefined,
+      zones,
+      [...unavailableExits],
+    );
     if (result.reachable) {
       paths[b.id] = result.path;
-    } else {
-      paths[b.id] = [];
-      alerts.push({
-        id: `no-path:${b.id}`,
-        kind: 'no-path',
-        boothId: b.id,
-        message: `展位 ${b.label} 正面接待点无法抵达任一出口，疏散通道被堵`,
-      });
+      continue;
     }
+    paths[b.id] = [];
+    // 归因：若忽略“临时关闭”（仍承认被物理封堵的出口不可用）就能到达，
+    // 则断路是出口关闭造成的；否则是完全断路。
+    const ignoringClosures = findExitPath(
+      booths,
+      start,
+      EXITS,
+      undefined,
+      zones,
+      blockedExitIds,
+    );
+    alerts.push({
+      id: `no-path:${b.id}`,
+      kind: 'no-path',
+      boothId: b.id,
+      cause: ignoringClosures.reachable ? 'exit-closed' : 'cutoff',
+      message: ignoringClosures.reachable
+        ? `展位 ${b.label} 无法抵达仍开放的出口：可走路线所依赖的出口已被临时关闭`
+        : `展位 ${b.label} 正面接待点无法抵达任一出口，疏散通道被堵`,
+    });
   }
 
-  return { alerts, paths, blockedExitIds };
+  return { alerts, paths, blockedExitIds, dualPaths, lockdown };
 }
 
 export function alertsForBooth(

@@ -4,9 +4,15 @@ interface ToolbarProps {
   onUndo: () => void;
   onRedo: () => void;
   onAddBooth: () => void;
-  onReset: (target: 'empty' | 'blocked-exit') => void;
+  onReset: (target: 'empty' | 'blocked-exit' | 'dual-route') => void;
   showPaths: boolean;
   onTogglePaths: () => void;
+  lockdownMode: boolean;
+  onToggleLockdownMode: () => void;
+  onClearLockdown: () => void;
+  lockdownActive: boolean;
+  onAutoDemo: () => void;
+  demoRunning: boolean;
 }
 
 export function Toolbar({
@@ -18,6 +24,12 @@ export function Toolbar({
   onReset,
   showPaths,
   onTogglePaths,
+  lockdownMode,
+  onToggleLockdownMode,
+  onClearLockdown,
+  lockdownActive,
+  onAutoDemo,
+  demoRunning,
 }: ToolbarProps) {
   return (
     <header className="toolbar">
@@ -28,8 +40,20 @@ export function Toolbar({
       </div>
 
       <div className="tb-group">
-        <button className="tb primary" onClick={onAddBooth}>
+        <button
+          className="tb primary"
+          onClick={onAddBooth}
+          disabled={lockdownMode}
+          title={lockdownMode ? '先退出临时封控模式再添加展位' : '添加一个普通展位'}
+        >
           ＋ 添加展位
+        </button>
+        <button
+          className={`tb ${lockdownMode ? 'lockdown-on' : ''}`}
+          onClick={onToggleLockdownMode}
+          title="进入/退出临时封控模式：可关闭出口、在网格上拖出封控区域"
+        >
+          {lockdownMode ? '🚧 退出封控模式' : '🚧 临时封控'}
         </button>
       </div>
 
@@ -52,6 +76,21 @@ export function Toolbar({
         </button>
         <button
           className="tb"
+          onClick={onClearLockdown}
+          disabled={!lockdownActive}
+          title="清除全部临时封控（开放出口、删除封控区域）"
+        >
+          清除封控
+        </button>
+        <button
+          className="tb"
+          onClick={() => onReset('dual-route')}
+          title="载入重点展位双通道演练示例"
+        >
+          载入“双通道”示例
+        </button>
+        <button
+          className="tb"
           onClick={() => onReset('blocked-exit')}
           title="载入内置的出口被堵示例方案"
         >
@@ -66,6 +105,17 @@ export function Toolbar({
           }}
         >
           方案重置
+        </button>
+      </div>
+
+      <div className="tb-group">
+        <button
+          className={`tb demo-btn ${demoRunning ? 'running' : ''}`}
+          onClick={onAutoDemo}
+          disabled={demoRunning}
+          title="90 秒内自动演练：单路 → 双路 → 关闭出口后降级 → 撤销恢复"
+        >
+          {demoRunning ? '演练进行中…' : '▶ 90 秒双通道演练'}
         </button>
       </div>
 

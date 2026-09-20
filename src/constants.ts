@@ -1,5 +1,5 @@
 /** 展厅与规则常量（单位：米）。 */
-import type { ExitDef } from './types';
+import type { ExitDef, Lockdown } from './types';
 
 export const HALL_WIDTH = 20;
 export const HALL_HEIGHT = 14;
@@ -21,3 +21,6 @@ export const EXITS: ExitDef[] = [
 
 /** 本地存储键。 */
 export const STORAGE_KEY = 'booth-planner:plan:v1';
+
+/** 无任何封控的初始状态。 */
+export const EMPTY_LOCKDOWN: Lockdown = { closedExits: [], zones: [] };

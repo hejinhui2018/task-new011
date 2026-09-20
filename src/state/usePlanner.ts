@@ -1,20 +1,34 @@
 /**
- * 排展工作台应用状态：展位列表 + 选中 + 撤销/重做 + 本地持久化。
+ * 排展工作台应用状态：展位列表 + 封控 + 选中 + 撤销/重做 + 本地持久化。
  * 拖拽过程中用 liveUpdateBooth 实时刷新画面（不入历史），松手时 commit 一次，
- * 保证一次拖动 = 一条撤销记录。
+ * 保证一次拖动 = 一条撤销记录。标记重点、出口开关、封控区域增删都走同一条
+ * History，因此撤销/重做/恢复示例对所有改动保持状态一致。
  *
  * 注意：所有对外部可变 History 的读写都在事件处理中基于 planRef 完成，
  * 不放进 setState 的 updater 内（StrictMode 会双调用 updater）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Booth, PlanState } from '../types';
+import type { Booth, PlanState, Point } from '../types';
 import { History } from '../lib/history';
 import { analyzePlan } from '../lib/validation';
-import { blockedExitScenario, emptyPlan, newBoothAt } from '../lib/scenarios';
+import {
+  blockedExitScenario,
+  dualRouteScenario,
+  emptyPlan,
+  newBoothAt,
+} from '../lib/scenarios';
 import { loadPlan, savePlan } from '../lib/persistence';
 import { GRID_SIZE } from '../constants';
 import { snapToGrid } from '../lib/grid';
 import { rotate90 } from '../lib/geometry';
+import {
+  addLockdownZoneFromCorners,
+  clearLockdown,
+  getLockdown,
+  removeLockdownZone,
+  setBoothCritical,
+  toggleExitClosed,
+} from '../lib/actions';
 
 function planEquals(a: PlanState, b: PlanState): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
@@ -23,6 +37,8 @@ function planEquals(a: PlanState, b: PlanState): boolean {
 function initialPlan(): PlanState {
   return loadPlan() ?? blockedExitScenario();
 }
+
+export type ScenarioTarget = 'empty' | 'blocked-exit' | 'dual-route';
 
 export function usePlanner() {
   const [plan, setPlanState] = useState<PlanState>(initialPlan);
@@ -49,12 +65,18 @@ export function usePlanner() {
     savePlan(plan);
   }, [plan]);
 
-  const analysis = useMemo(() => analyzePlan(plan.booths), [plan.booths]);
+  const lockdown = getLockdown(plan);
+  const analysis = useMemo(
+    () => analyzePlan(plan.booths, getLockdown(plan)),
+    [plan],
+  );
 
   const replaceBooth = useCallback(
     (id: string, patch: Partial<Booth>) => {
+      const prev = planRef.current;
       const next: PlanState = {
-        booths: planRef.current.booths.map((b) =>
+        ...prev,
+        booths: prev.booths.map((b) =>
           b.id === id ? { ...b, ...patch } : b,
         ),
       };
@@ -73,7 +95,7 @@ export function usePlanner() {
     bumpHistory();
   }, [history, applyPlan]);
 
-  /** 离散操作（旋转、删除、改参数）立即提交一条历史。 */
+  /** 离散操作（旋转、删除、改参数、封控变更）立即提交一条历史。 */
   const commitNow = useCallback(
     (updater: (prev: PlanState) => PlanState) => {
       applyPlan(history.commit(updater(planRef.current)));
@@ -91,7 +113,7 @@ export function usePlanner() {
       snapToGrid(1 + (index % 8) * GRID_SIZE),
       index,
     );
-    commitNow(() => ({ booths: [...prev.booths, booth] }));
+    commitNow((p) => ({ ...p, booths: [...p.booths, booth] }));
     setSelectedId(booth.id);
   }, [commitNow]);
 
@@ -105,7 +127,7 @@ export function usePlanner() {
         snapToGrid(y - 1, GRID_SIZE),
         index,
       );
-      commitNow(() => ({ booths: [...prev.booths, booth] }));
+      commitNow((p) => ({ ...p, booths: [...p.booths, booth] }));
       setSelectedId(booth.id);
     },
     [commitNow],
@@ -114,6 +136,7 @@ export function usePlanner() {
   const rotateBooth = useCallback(
     (id: string) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.map((b) => (b.id === id ? rotate90(b) : b)),
       }));
     },
@@ -128,6 +151,7 @@ export function usePlanner() {
   const setOrientation = useCallback(
     (id: string, orientation: Booth['orientation']) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.map((b) =>
           b.id === id ? { ...b, orientation } : b,
         ),
@@ -144,6 +168,7 @@ export function usePlanner() {
       value: string | number,
     ) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.map((b) => {
           if (b.id !== id) return b;
           if (field === 'label') return { ...b, label: String(value) };
@@ -155,9 +180,49 @@ export function usePlanner() {
     [commitNow],
   );
 
+  /** 标记 / 取消重点展位。 */
+  const toggleCritical = useCallback(
+    (id: string) => {
+      commitNow((prev) => {
+        const b = prev.booths.find((x) => x.id === id);
+        if (!b || b.kind === 'partition') return prev;
+        return setBoothCritical(prev, id, !b.critical);
+      });
+    },
+    [commitNow],
+  );
+
+  /** 临时封控：开关某个出口。 */
+  const toggleExitClosedState = useCallback(
+    (exitId: string) => {
+      commitNow((prev) => toggleExitClosed(prev, exitId));
+    },
+    [commitNow],
+  );
+
+  /** 临时封控：由拖出的两个角点提交一个封控区域（一条历史）。 */
+  const addLockdownZone = useCallback(
+    (a: Point, b: Point) => {
+      commitNow((prev) => addLockdownZoneFromCorners(prev, a, b));
+    },
+    [commitNow],
+  );
+
+  const removeZone = useCallback(
+    (zoneId: string) => {
+      commitNow((prev) => removeLockdownZone(prev, zoneId));
+    },
+    [commitNow],
+  );
+
+  const clearAllLockdown = useCallback(() => {
+    commitNow((prev) => clearLockdown(prev));
+  }, [commitNow]);
+
   const deleteBooth = useCallback(
     (id: string) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.filter((b) => b.id !== id),
       }));
       setSelectedId((cur) => (cur === id ? null : cur));
@@ -180,8 +245,13 @@ export function usePlanner() {
   }, [history, applyPlan]);
 
   const resetPlan = useCallback(
-    (target: 'empty' | 'blocked-exit' = 'empty') => {
-      const next = target === 'empty' ? emptyPlan() : blockedExitScenario();
+    (target: ScenarioTarget = 'empty') => {
+      const next =
+        target === 'empty'
+          ? emptyPlan()
+          : target === 'dual-route'
+            ? dualRouteScenario()
+            : blockedExitScenario();
       // 作为一条历史提交，重置/载入示例后可用 Ctrl+Z 恢复原方案
       applyPlan(history.commit(next));
       setSelectedId(null);
@@ -230,6 +300,7 @@ export function usePlanner() {
               : 0;
         if (dx || dy) {
           commitNow((prev) => ({
+            ...prev,
             booths: prev.booths.map((b) =>
               b.id === id
                 ? {
@@ -249,6 +320,7 @@ export function usePlanner() {
 
   return {
     booths: plan.booths,
+    lockdown,
     selectedId,
     analysis,
     selectBooth: setSelectedId,
@@ -262,6 +334,11 @@ export function usePlanner() {
     rotateBooth,
     setOrientation,
     updateBoothField,
+    toggleCritical,
+    toggleExitClosed: toggleExitClosedState,
+    addLockdownZone,
+    removeZone,
+    clearLockdown: clearAllLockdown,
     deleteBooth,
     deleteSelected,
     undo,

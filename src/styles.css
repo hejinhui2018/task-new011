@@ -56,6 +56,7 @@ body {
   border-bottom: 1px solid var(--border);
   box-shadow: var(--shadow);
   z-index: 5;
+  overflow-x: auto;
 }
 
 .toolbar .brand {
@@ -130,6 +131,22 @@ button.tb.primary:hover:not(:disabled) {
 }
 button.tb.danger-text {
   color: var(--danger);
+}
+button.tb.lockdown-on {
+  background: #fff7ed;
+  border-color: #fb923c;
+  color: #c2410c;
+  font-weight: 700;
+}
+button.tb.demo-btn {
+  background: #eff6ff;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+  font-weight: 700;
+}
+button.tb.demo-btn.running {
+  background: var(--accent-soft);
+  opacity: 0.75;
 }
 button.tb .k {
   font-size: 11px;
@@ -233,6 +250,68 @@ button.tb .k {
 .legend .swatch.nopath {
   border-color: var(--purple);
   background: var(--purple-soft);
+}
+.legend .swatch.path-alt {
+  border: none;
+  height: 0;
+  border-top: 3px dashed #2563eb;
+  width: 18px;
+}
+.legend .swatch.path-single {
+  border: none;
+  height: 0;
+  border-top: 3px dashed var(--warn);
+  width: 18px;
+}
+.legend .swatch.lockdown {
+  border-color: #c2410c;
+  background: repeating-linear-gradient(
+    45deg,
+    #ffedd5,
+    #ffedd5 3px,
+    #fdba74 3px,
+    #fdba74 6px
+  );
+}
+
+/* 封控模式横幅 */
+.lockdown-banner {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: #c2410c;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  letter-spacing: 0.08em;
+}
+
+/* 自动演练解说条 */
+.demo-narration {
+  position: absolute;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  max-width: 70%;
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 9px 16px;
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  text-align: center;
+}
+.demo-narration.live {
+  border: 1px solid #60a5fa;
+}
+.demo-narration.done {
+  opacity: 0.85;
 }
 
 .hint-chip {
@@ -369,6 +448,102 @@ button.tb .k {
   background: var(--purple-soft);
   color: var(--purple);
   border-color: #c4b5fd;
+}
+.kind-exit-closed {
+  background: #ffedd5;
+  color: #c2410c;
+  border-color: #fdba74;
+}
+.kind-single-route {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: #fcd34d;
+}
+
+/* 告警根因小标签：出口关闭 / 空间瓶颈 / 完全断路 */
+.cause-tag {
+  display: inline-block;
+  margin-left: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.cause-exit-closed {
+  color: #c2410c;
+}
+.cause-bottleneck {
+  color: var(--warn);
+}
+.cause-cutoff {
+  color: var(--purple);
+}
+
+/* 重点展位开关 */
+.critical-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.critical-toggle .ct-star {
+  font-size: 17px;
+  color: var(--warn);
+}
+.critical-toggle.on {
+  border-style: solid;
+  border-color: #d97706;
+  background: #fffbeb;
+  color: #92400e;
+  font-weight: 700;
+}
+
+/* 双通道状态卡 */
+.dual-status {
+  margin-top: 8px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  border: 1px solid;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.dual-status b {
+  font-size: 12.5px;
+}
+.dual-ok {
+  background: var(--ok-soft);
+  border-color: #86efac;
+  color: #166534;
+}
+.dual-single {
+  background: var(--warn-soft);
+  border-color: #fcd34d;
+  color: #92400e;
+}
+.dual-none {
+  background: var(--purple-soft);
+  border-color: #c4b5fd;
+  color: #5b21b6;
+}
+
+/* 状态栏封控标记 */
+.statusbar .lockdown-stat {
+  color: #c2410c;
+  font-weight: 700;
 }
 
 .empty-alerts {

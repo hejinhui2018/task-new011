@@ -21,6 +21,7 @@ import {
   intersects,
 } from '../lib/geometry';
 import { screenToWorld, snapResize, snapToGrid } from '../lib/grid';
+import { zoneFromCorners } from '../lib/actions';
 
 type HandleId = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -42,7 +43,16 @@ interface PanSession {
   startPan: Point;
   moved: boolean;
 }
-type Session = DragSession | ResizeSession | PanSession;
+interface ZoneDragSession {
+  type: 'zone-drag';
+  /** 起点（米，已吸附） */
+  start: Point;
+  /** 当前角点（米），用于实时预览 */
+  current: Point;
+  /** 拖动是否已达到一个网格（不足则不生成区域） */
+  moved: boolean;
+}
+type Session = DragSession | ResizeSession | PanSession | ZoneDragSession;
 
 const MIN_SIZE = GRID_SIZE;
 // 缩放倍率上下限（相对于“适应窗口”的基准比例）
@@ -55,6 +65,7 @@ interface FloorPlanProps {
   activeAlertId: string | null;
   onActiveAlertChange: (id: string | null) => void;
   onZoomChange: (zoom: number) => void;
+  lockdownMode: boolean;
 }
 
 export function FloorPlan({
@@ -63,6 +74,7 @@ export function FloorPlan({
   activeAlertId,
   onActiveAlertChange,
   onZoomChange,
+  lockdownMode,
 }: FloorPlanProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [size, setSize] = useState({ w: 1000, h: 700 });
@@ -73,8 +85,9 @@ export function FloorPlan({
   const sessionRef = useRef<Session | null>(null);
   sessionRef.current = session;
   const panMovedRef = useRef(false);
+  const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
 
-  const { booths, analysis, selectedId } = planner;
+  const { booths, analysis, selectedId, lockdown } = planner;
 
   /* ---------- 尺寸与适应窗口 ---------- */
   /** 画布容器（svg 的父节点 .canvas-wrap）。 */
@@ -207,6 +220,7 @@ export function FloorPlan({
 
   /* ---------- 指针会话 ---------- */
   const startBoothDrag = (e: React.PointerEvent, b: Booth) => {
+    if (lockdownMode) return; // 封控模式下不拖动展位（改为拖封控区域）
     e.stopPropagation();
     (e.target as Element).setPointerCapture?.(e.pointerId);
     planner.selectBooth(b.id);
@@ -219,6 +233,7 @@ export function FloorPlan({
   };
 
   const startResize = (e: React.PointerEvent, b: Booth, handle: HandleId) => {
+    if (lockdownMode) return;
     e.stopPropagation();
     (e.target as Element).setPointerCapture?.(e.pointerId);
     planner.selectBooth(b.id);
@@ -232,6 +247,13 @@ export function FloorPlan({
 
   const startPan = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    // 封控模式：在空白处按下开始拖封控区域；普通模式：拖动画布平移。
+    if (lockdownMode) {
+      const w = toWorld(e.clientX, e.clientY);
+      const start = { x: snapToGrid(w.x), y: snapToGrid(w.y) };
+      setSession({ type: 'zone-drag', start, current: start, moved: false });
+      return;
+    }
     setSession({
       type: 'pan',
       startPx: { x: e.clientX, y: e.clientY },
@@ -251,6 +273,14 @@ export function FloorPlan({
         const dy = e.clientY - s.startPx.y;
         if (Math.abs(dx) + Math.abs(dy) > 3) s.moved = true;
         setPan(clampPan({ x: s.startPan.x + dx, y: s.startPan.y + dy }, scale));
+        return;
+      }
+      if (s.type === 'zone-drag') {
+        const w = toWorld(e.clientX, e.clientY);
+        const current = { x: w.x, y: w.y };
+        const r = zoneFromCorners(s.start, current);
+        s.moved = r !== null;
+        setSession({ ...s, current });
         return;
       }
       const w = toWorld(e.clientX, e.clientY);
@@ -273,6 +303,11 @@ export function FloorPlan({
 
     const onUp = () => {
       const s = sessionRef.current;
+      if (s && s.type === 'zone-drag') {
+        if (s.moved) planner.addLockdownZone(s.start, s.current);
+        setSession(null);
+        return;
+      }
       if (s && s.type !== 'pan') planner.commitInteraction();
       if (s?.type === 'pan') panMovedRef.current = s.moved;
       setSession(null);
@@ -288,6 +323,7 @@ export function FloorPlan({
 
   /* ---------- 双击添加 / 单击空白取消选中 ---------- */
   const onDoubleClick = (e: React.MouseEvent) => {
+    if (lockdownMode) return; // 封控模式下不添加展位
     const w = toWorld(e.clientX, e.clientY);
     if (w.x < 0 || w.y < 0 || w.x > HALL_WIDTH || w.y > HALL_HEIGHT) return;
     planner.addBoothAt(w.x, w.y);
@@ -298,8 +334,15 @@ export function FloorPlan({
       panMovedRef.current = false;
       return;
     }
+    setSelectedZoneId(null);
     planner.selectBooth(null);
     onActiveAlertChange(null);
+  };
+
+  /** 封控模式下点击出口：开关该出口。 */
+  const onExitClick = (exitId: string) => {
+    if (!lockdownMode) return;
+    planner.toggleExitClosed(exitId);
   };
 
   /* ---------- 派生标注 ---------- */
@@ -372,6 +415,17 @@ export function FloorPlan({
             <line x1="0.25" y1="0.2" x2="0.25" y2="0.4" stroke="#8d6e63" strokeWidth={0.02} />
             <line x1="0.5" y1="0" x2="0.5" y2="0.2" stroke="#8d6e63" strokeWidth={0.02} />
           </pattern>
+          {/* 临时封控斜纹 */}
+          <pattern
+            id="hatch-lockdown"
+            patternUnits="userSpaceOnUse"
+            width={0.26}
+            height={0.26}
+            patternTransform="rotate(45)"
+          >
+            <rect width={0.26} height={0.26} fill="rgba(194,65,12,0.12)" />
+            <line x1="0" y1="0" x2="0" y2={0.26} stroke="#c2410c" strokeWidth={0.06} />
+          </pattern>
         </defs>
 
         <g transform={`translate(${pan.x},${pan.y}) scale(${scale})`}>
@@ -397,27 +451,101 @@ export function FloorPlan({
 
           <Grid u={u} />
 
-          {/* 疏散路径（展位下层） */}
-          {showPaths &&
-            booths.map((b) => {
-              const path = analysis.paths[b.id];
-              if (!path || path.length < 2) return null;
-              const strong = b.id === selectedId;
+          {/* 疏散路径（展位下层）：普通展位单路 + 重点展位双路 */}
+          {showPaths && (
+            <Routes
+              booths={booths}
+              analysis={analysis}
+              selectedId={selectedId}
+              u={u}
+            />
+          )}
+
+          {/* 临时封控区域 */}
+          {lockdown.zones.map((z) => (
+            <g
+              key={`zone-${z.id}`}
+              style={{ cursor: lockdownMode ? 'pointer' : 'default' }}
+              onPointerDown={(e) => {
+                if (!lockdownMode) return;
+                e.stopPropagation();
+                setSelectedZoneId(z.id);
+              }}
+            >
+              <rect
+                x={z.x}
+                y={z.y}
+                width={z.w}
+                height={z.h}
+                fill="url(#hatch-lockdown)"
+                stroke={selectedZoneId === z.id ? '#b91c1c' : '#c2410c'}
+                strokeWidth={(selectedZoneId === z.id ? 2.6 : 1.6) * u}
+                strokeDasharray={`${0.2} ${0.12}`}
+                pointerEvents={lockdownMode ? 'all' : 'none'}
+              />
+              <text
+                x={z.x + z.w / 2}
+                y={z.y + z.h / 2 + 0.07}
+                textAnchor="middle"
+                fontSize={Math.min(0.26, Math.max(0.18, Math.min(z.w, z.h) * 0.5))}
+                fill="#9a3412"
+                fontWeight={700}
+                pointerEvents="none"
+              >
+                封控
+              </text>
+              {lockdownMode && selectedZoneId === z.id && (
+                <g
+                  pointerEvents="all"
+                  style={{ cursor: 'pointer' }}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    planner.removeZone(z.id);
+                    setSelectedZoneId(null);
+                  }}
+                >
+                  <circle
+                    cx={z.x + z.w}
+                    cy={z.y}
+                    r={0.18}
+                    fill="#b91c1c"
+                    stroke="#fff"
+                    strokeWidth={1.4 * u}
+                  />
+                  <text
+                    x={z.x + z.w}
+                    y={z.y + 0.07}
+                    textAnchor="middle"
+                    fontSize={0.22}
+                    fill="#fff"
+                    fontWeight={700}
+                  >
+                    ✕
+                  </text>
+                </g>
+              )}
+            </g>
+          ))}
+
+          {/* 正在拖出的封控区域预览 */}
+          {session?.type === 'zone-drag' &&
+            (() => {
+              const r = zoneFromCorners(session.start, session.current);
+              if (!r) return null;
               return (
-                <polyline
-                  key={`path-${b.id}`}
-                  points={path.map((p) => `${p.x},${p.y}`).join(' ')}
-                  fill="none"
-                  stroke="#15803d"
-                  strokeWidth={(strong ? 3.4 : 2) * u}
-                  strokeDasharray={`${0.28} ${0.2}`}
-                  opacity={strong ? 0.95 : selectedId ? 0.18 : 0.4}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+                <rect
+                  x={r.x}
+                  y={r.y}
+                  width={r.w}
+                  height={r.h}
+                  fill="rgba(194,65,12,0.16)"
+                  stroke="#c2410c"
+                  strokeWidth={1.8 * u}
+                  strokeDasharray={`${0.2} ${0.12}`}
                   pointerEvents="none"
                 />
               );
-            })}
+            })()}
 
           {/* 重叠区域红斜纹 */}
           {overlapRegions.map((r, i) => (
@@ -435,7 +563,13 @@ export function FloorPlan({
           ))}
 
           {/* 墙体与出口 */}
-          <Walls u={u} blockedExitIds={analysis.blockedExitIds} />
+          <Walls
+            u={u}
+            blockedExitIds={analysis.blockedExitIds}
+            closedExitIds={lockdown.closedExits}
+            lockdownMode={lockdownMode}
+            onExitClick={onExitClick}
+          />
 
           {/* 展位 */}
           {booths.map((b) => (
@@ -451,6 +585,8 @@ export function FloorPlan({
               )}
               emphasized={activeBoothIds.has(b.id)}
               reachable={(analysis.paths[b.id]?.length ?? 0) > 0}
+              dualStatus={analysis.dualPaths[b.id]?.status ?? null}
+              lockdownMode={lockdownMode}
               onPointerDown={(e) => startBoothDrag(e, b)}
               onHandleDown={(e, h) => startResize(e, b, h)}
               onRotate={() => planner.rotateBooth(b.id)}
@@ -479,6 +615,112 @@ export function FloorPlan({
       />
     </>
   );
+}
+
+/* ================= 疏散路径（普通单路 + 重点双路） ================= */
+
+function Routes({
+  booths,
+  analysis,
+  selectedId,
+  u,
+}: {
+  booths: Booth[];
+  analysis: PlannerApi['analysis'];
+  selectedId: string | null;
+  u: number;
+}) {
+  const criticalIds = new Set(
+    booths.filter((b) => b.critical && b.kind !== 'partition').map((b) => b.id),
+  );
+
+  const polyline = (
+    key: string,
+    pts: Point[],
+    color: string,
+    width: number,
+    opacity: number,
+    dash: string,
+  ) =>
+    pts.length >= 2 ? (
+      <polyline
+        key={key}
+        points={pts.map((p) => `${p.x},${p.y}`).join(' ')}
+        fill="none"
+        stroke={color}
+        strokeWidth={width * u}
+        strokeDasharray={dash}
+        opacity={opacity}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        pointerEvents="none"
+      />
+    ) : null;
+
+  const lines: React.ReactNode[] = [];
+
+  for (const b of booths) {
+    if (b.kind === 'partition') continue;
+    const strong = b.id === selectedId;
+    const dim = selectedId ? (strong ? 1 : 0.16) : 1;
+
+    if (criticalIds.has(b.id)) {
+      const d = analysis.dualPaths[b.id];
+      if (!d) continue;
+      if (d.status === 'dual') {
+        // 双路：绿（主，去一出口）+ 蓝（次，去另一出口），实线虚线区分
+        lines.push(
+          polyline(
+            `dual-a-${b.id}`,
+            d.primary,
+            '#15803d',
+            strong ? 3.4 : 2.4,
+            (strong ? 0.95 : 0.55) * dim + (dim < 1 ? 0.06 : 0),
+            `${0.3} ${0.18}`,
+          ),
+        );
+        lines.push(
+          polyline(
+            `dual-b-${b.id}`,
+            d.secondary,
+            '#2563eb',
+            strong ? 3.4 : 2.4,
+            (strong ? 0.95 : 0.55) * dim + (dim < 1 ? 0.06 : 0),
+            `${0.12} ${0.14}`,
+          ),
+        );
+      } else if (d.status === 'single') {
+        // 仅单路：琥珀色
+        lines.push(
+          polyline(
+            `single-${b.id}`,
+            d.primary,
+            '#b45309',
+            strong ? 3.4 : 2.4,
+            (strong ? 0.95 : 0.6) * dim + (dim < 1 ? 0.06 : 0),
+            `${0.26} ${0.16}`,
+          ),
+        );
+      }
+      // none：完全不可达，不画路径（接待点显示紫叉、告警面板列出）
+      continue;
+    }
+
+    const path = analysis.paths[b.id];
+    if (path && path.length >= 2) {
+      lines.push(
+        polyline(
+          `path-${b.id}`,
+          path,
+          '#15803d',
+          strong ? 3.4 : 2,
+          strong ? 0.95 : selectedId ? 0.18 : 0.4,
+          `${0.28} ${0.2}`,
+        ),
+      );
+    }
+  }
+  return <g>{lines}</g>;
 }
 
 /* ================= 网格 ================= */
@@ -523,9 +765,15 @@ function Grid({ u }: { u: number }) {
 function Walls({
   u,
   blockedExitIds,
+  closedExitIds,
+  lockdownMode,
+  onExitClick,
 }: {
   u: number;
   blockedExitIds: string[];
+  closedExitIds: string[];
+  lockdownMode: boolean;
+  onExitClick: (exitId: string) => void;
 }) {
   const t = 0.22; // 墙厚（米）
   const wallColor = '#475569';
@@ -548,6 +796,8 @@ function Walls({
 
       {EXITS.map((exitDef) => {
         const blocked = blockedExitIds.includes(exitDef.id);
+        const closed = closedExitIds.includes(exitDef.id);
+        const unavailable = blocked || closed;
         const horizontal = exitDef.wall === 'north' || exitDef.wall === 'south';
         const mid = (exitDef.start + exitDef.end) / 2;
         const len = exitDef.end - exitDef.start;
@@ -576,18 +826,55 @@ function Walls({
             ? HALL_HEIGHT + 0.78
             : -0.78
           : mid;
-        const color = blocked ? '#b91c1c' : '#15803d';
+        const color = blocked
+          ? '#b91c1c'
+          : closed
+            ? '#c2410c'
+            : '#15803d';
+        const zoneFill = blocked
+          ? 'rgba(185,28,28,0.22)'
+          : closed
+            ? 'rgba(194,65,12,0.22)'
+            : 'rgba(21,128,61,0.18)';
+        const statusText = blocked ? '出口堵死' : closed ? '临时关闭' : '安全出口';
 
         return (
-          <g key={exitDef.id}>
-            {/* 出口内侧绿色/红色地带 */}
+          <g
+            key={exitDef.id}
+            style={{ cursor: lockdownMode ? 'pointer' : 'default' }}
+            onPointerDown={(e) => {
+              if (!lockdownMode) return;
+              e.stopPropagation();
+              onExitClick(exitDef.id);
+            }}
+          >
+            {/* 封控模式下的加大隐形热区 */}
+            {lockdownMode &&
+              (horizontal ? (
+                <rect
+                  x={x - 0.2}
+                  y={exitDef.wall === 'south' ? HALL_HEIGHT - 0.9 : -0.9}
+                  width={len + 0.4}
+                  height={1.2}
+                  fill="transparent"
+                />
+              ) : (
+                <rect
+                  x={exitDef.wall === 'east' ? HALL_WIDTH - 0.9 : -0.9}
+                  y={y - 0.2}
+                  width={1.2}
+                  height={len + 0.4}
+                  fill="transparent"
+                />
+              ))}
+            {/* 出口内侧绿色/红色/橙色地带 */}
             {horizontal ? (
               <rect
                 x={x}
                 y={exitDef.wall === 'south' ? HALL_HEIGHT - inset : 0}
                 width={len}
                 height={inset}
-                fill={blocked ? 'rgba(185,28,28,0.22)' : 'rgba(21,128,61,0.18)'}
+                fill={zoneFill}
               />
             ) : (
               <rect
@@ -595,7 +882,7 @@ function Walls({
                 y={y}
                 width={inset}
                 height={len}
-                fill={blocked ? 'rgba(185,28,28,0.22)' : 'rgba(21,128,61,0.18)'}
+                fill={zoneFill}
               />
             )}
             {/* 出口边框 */}
@@ -618,7 +905,7 @@ function Walls({
                 width={1.24}
                 height={0.4}
                 rx={0.06}
-                fill={blocked ? '#b91c1c' : '#15803d'}
+                fill={color}
               />
               <text
                 x={labelX}
@@ -628,12 +915,12 @@ function Walls({
                 fill="#fff"
                 fontWeight={700}
               >
-                {blocked ? '出口堵死' : '安全出口'}
+                {statusText}
               </text>
             </g>
-            {blocked && (
+            {unavailable && (
               <g className="exit-cross">
-                {/* 红叉画在墙外一侧 */}
+                {/* 红叉（封堵）/ 橙叉（临时关闭）画在墙外一侧 */}
                 {horizontal ? (
                   <>
                     <line
@@ -641,7 +928,7 @@ function Walls({
                       y1={exitDef.wall === 'south' ? HALL_HEIGHT + 0.06 : -0.06}
                       x2={x + len - 0.2}
                       y2={exitDef.wall === 'south' ? HALL_HEIGHT + 0.42 : -0.42}
-                      stroke="#b91c1c"
+                      stroke={color}
                       strokeWidth={4 * u}
                       strokeLinecap="round"
                     />
@@ -650,7 +937,7 @@ function Walls({
                       y1={exitDef.wall === 'south' ? HALL_HEIGHT + 0.42 : -0.42}
                       x2={x + len - 0.2}
                       y2={exitDef.wall === 'south' ? HALL_HEIGHT + 0.06 : -0.06}
-                      stroke="#b91c1c"
+                      stroke={color}
                       strokeWidth={4 * u}
                       strokeLinecap="round"
                     />
@@ -662,7 +949,7 @@ function Walls({
                       y1={y + 0.2}
                       x2={exitDef.wall === 'east' ? HALL_WIDTH + 0.42 : -0.42}
                       y2={y + len - 0.2}
-                      stroke="#b91c1c"
+                      stroke={color}
                       strokeWidth={4 * u}
                       strokeLinecap="round"
                     />
@@ -671,7 +958,7 @@ function Walls({
                       y1={y + len - 0.2}
                       x2={exitDef.wall === 'east' ? HALL_WIDTH + 0.42 : -0.42}
                       y2={y + 0.2}
-                      stroke="#b91c1c"
+                      stroke={color}
                       strokeWidth={4 * u}
                       strokeLinecap="round"
                     />
@@ -736,6 +1023,8 @@ const KIND_STYLE: Record<
   'out-of-bounds': { color: '#b91c1c', char: '界', title: '越界' },
   clearance: { color: '#b45309', char: '距', title: '净空不足' },
   'exit-blocked': { color: '#b91c1c', char: '封', title: '封住出口' },
+  'exit-closed': { color: '#c2410c', char: '关', title: '出口临时关闭' },
+  'single-route': { color: '#b45309', char: '单', title: '仅一条疏散通道' },
   'no-path': { color: '#6d28d9', char: '堵', title: '疏散不可达' },
 };
 
@@ -747,6 +1036,8 @@ interface BoothViewProps {
   alerts: Alert[];
   emphasized: boolean;
   reachable: boolean;
+  dualStatus: 'dual' | 'single' | 'none' | null;
+  lockdownMode: boolean;
   onPointerDown: (e: React.PointerEvent) => void;
   onHandleDown: (e: React.PointerEvent, h: HandleId) => void;
   onRotate: () => void;
@@ -760,18 +1051,23 @@ function BoothView({
   alerts,
   emphasized,
   reachable,
+  dualStatus,
+  lockdownMode,
   onPointerDown,
   onHandleDown,
   onRotate,
   onAlertClick,
 }: BoothViewProps) {
   const isPartition = b.kind === 'partition';
+  const isCritical = b.critical === true && !isPartition;
   const [p1, p2] = frontEdge(b);
   const recv = receptionPoint(b);
   // 去重告警类型，同类型只显示一个徽标
   const badgeAlerts = alerts.filter(
     (a, i, arr) => arr.findIndex((x) => x.kind === a.kind) === i,
   );
+  // 封控模式下不展示选中手柄（此时只能编辑封控，不能编辑展位）
+  const interactive = selected && !lockdownMode;
 
   return (
     <g>
@@ -856,7 +1152,7 @@ function BoothView({
         </text>
       )}
 
-      {/* 接待点（围挡没有接待点） */}
+      {/* 接待点（围挡没有接待点）：双路绿 / 单路琥珀 / 不可达紫 */}
       {!isPartition && (
         <>
           <circle
@@ -864,7 +1160,13 @@ function BoothView({
             cy={recv.y}
             r={0.1}
             fill="#fff"
-            stroke={reachable ? '#15803d' : '#6d28d9'}
+            stroke={
+              dualStatus === 'single'
+                ? '#b45309'
+                : !reachable
+                  ? '#6d28d9'
+                  : '#15803d'
+            }
             strokeWidth={2 * u}
             pointerEvents="none"
           />
@@ -875,6 +1177,31 @@ function BoothView({
             </g>
           )}
         </>
+      )}
+
+      {/* 重点展位标记：右上角金色“重”徽标 + 金色外框（不只靠颜色） */}
+      {isCritical && (
+        <g pointerEvents="none">
+          <rect
+            x={b.x + 0.12}
+            y={b.y + 0.12}
+            width={Math.min(b.w, 0.5)}
+            height={0.26}
+            rx={0.05}
+            fill="#b45309"
+            opacity={0.92}
+          />
+          <text
+            x={b.x + 0.12 + Math.min(b.w, 0.5) / 2}
+            y={b.y + 0.3}
+            textAnchor="middle"
+            fontSize={0.17}
+            fill="#fff"
+            fontWeight={700}
+          >
+            重点
+          </text>
+        </g>
       )}
 
       {/* 告警描边（每种类型一层虚线，形状/颜色双重区分） */}
@@ -926,8 +1253,8 @@ function BoothView({
         })}
       </g>
 
-      {/* 选中：8 手柄 + 旋转钮 */}
-      {selected && (
+      {/* 选中：8 手柄 + 旋转钮（封控模式下不显示） */}
+      {interactive && (
         <g pointerEvents="none">
           {(['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'] as HandleId[]).map(
             (h) => {
