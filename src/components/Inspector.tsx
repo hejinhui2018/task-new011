@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import type { Alert, Booth, Orientation } from '../types';
+import type { Alert, Booth, DualRouteResult, Orientation } from '../types';
 import type { PlannerApi } from '../state/usePlanner';
-import { alertsForBooth } from '../lib/validation';
+import { alertsForBooth, exitName } from '../lib/validation';
 
 const ORIENTATIONS: { value: Orientation; label: string }[] = [
   { value: 'north', label: '朝北' },
@@ -12,18 +12,22 @@ const ORIENTATIONS: { value: Orientation; label: string }[] = [
 
 const KIND_LABEL: Record<Alert['kind'], string> = {
   'exit-blocked': '封住出口',
+  'exit-closed': '出口临时关闭',
   overlap: '与相邻展位重叠',
   'out-of-bounds': '超出展厅边界',
   clearance: '通道净空不足 1.5 m',
   'no-path': '接待点无法抵达出口',
+  'single-route': '重点展位仅单路疏散',
 };
 
 const KIND_CLS: Record<Alert['kind'], string> = {
   'exit-blocked': 'kind-exit-blocked',
+  'exit-closed': 'kind-exit-closed',
   overlap: 'kind-overlap',
   'out-of-bounds': 'kind-out-of-bounds',
   clearance: 'kind-clearance',
   'no-path': 'kind-no-path',
+  'single-route': 'kind-single-route',
 };
 
 interface InspectorProps {
@@ -39,6 +43,7 @@ export function Inspector({ planner, onAlertClick }: InspectorProps) {
       <div className="section-head">
         展位属性
         {booth && <span className="count">{booth.label}</span>}
+        {booth?.critical && <span className="count critical-tag">重点展位</span>}
       </div>
       <div className="inspector">
         {!booth ? (
@@ -52,6 +57,8 @@ export function Inspector({ planner, onAlertClick }: InspectorProps) {
             · 拖动移动，8 个手柄缩放
             <br />
             · <b>R</b> 或蓝色旋钮旋转 90°
+            <br />
+            · 勾选“重点展位”启用双通道演练
           </div>
         ) : (
           <SelectedInspector
@@ -105,6 +112,49 @@ function CommitInput({
   );
 }
 
+function DualRouteCard({ result }: { result: DualRouteResult }) {
+  if (result.status === 'dual') {
+    return (
+      <div className="dual-card dual-ok">
+        <div className="dual-title">✓ 双路可用</div>
+        <div className="dual-desc">
+          两条疏散路线除接待点外不共用通行网格：
+          <br />
+          路线 1 → {exitName(result.exitIds[0]!)}
+          <br />
+          路线 2 → {exitName(result.exitIds[1]!)}
+        </div>
+      </div>
+    );
+  }
+  if (result.status === 'single') {
+    return (
+      <div className="dual-card dual-single">
+        <div className="dual-title">⚠ 仅单路</div>
+        <div className="dual-desc">
+          只能找到一条通往
+          {result.exitIds[0] ? ` ${exitName(result.exitIds[0])} ` : '开放出口'}
+          的不相交路线。
+          <br />
+          {result.reason === 'exit-closed'
+            ? '降级原因：出口被临时关闭或封堵。'
+            : '降级原因：空间瓶颈，第二条通道走不通。'}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="dual-card dual-none">
+      <div className="dual-title">✕ 完全不可达</div>
+      <div className="dual-desc">
+        {result.reason === 'exit-closed'
+          ? '所有出口均已关闭或被封堵，无疏散能力。'
+          : '接待点到任何开放出口都完全断路，请立即清理通道。'}
+      </div>
+    </div>
+  );
+}
+
 function SelectedInspector({
   booth,
   planner,
@@ -115,13 +165,17 @@ function SelectedInspector({
   onAlertClick: (a: Alert) => void;
 }) {
   const myAlerts = alertsForBooth(planner.analysis, booth.id);
+  const isPartition = booth.kind === 'partition';
+  const dual = planner.analysis.dual[booth.id];
 
   return (
     <>
       <h4>检查状态</h4>
       {myAlerts.length === 0 ? (
-        booth.kind === 'partition' ? (
+        isPartition ? (
           <div className="insp-empty">✓ 围挡位置正常（围挡是通道障碍，无接待点）</div>
+        ) : booth.critical ? (
+          <div className="insp-empty">✓ 无其他告警，双通道状态见下方卡片</div>
         ) : (
           <div className="insp-empty">✓ 该展位无问题，疏散路径可达出口</div>
         )
@@ -143,6 +197,28 @@ function SelectedInspector({
             {a.message}
           </button>
         ))
+      )}
+
+      {!isPartition && (
+        <>
+          <h4>疏散演练等级</h4>
+          <label className="critical-switch">
+            <input
+              type="checkbox"
+              checked={booth.critical === true}
+              onChange={() => planner.toggleCritical(booth.id)}
+            />
+            <span>
+              <b>重点展位</b>
+              <small>需要两条通往不同出口、不共用通行网格的疏散路线</small>
+            </span>
+          </label>
+          {booth.critical && dual && (
+            <div style={{ marginTop: 8 }}>
+              <DualRouteCard result={dual} />
+            </div>
+          )}
+        </>
       )}
 
       <h4>基本信息</h4>

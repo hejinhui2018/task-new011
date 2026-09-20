@@ -42,7 +42,13 @@ interface PanSession {
   startPan: Point;
   moved: boolean;
 }
-type Session = DragSession | ResizeSession | PanSession;
+/** 临时封控模式：在空白处拖出封控矩形（过程中不入历史，松手提交一次）。 */
+interface ZoneSession {
+  type: 'zone';
+  start: Point;
+  current: Point;
+}
+type Session = DragSession | ResizeSession | PanSession | ZoneSession;
 
 const MIN_SIZE = GRID_SIZE;
 // 缩放倍率上下限（相对于“适应窗口”的基准比例）
@@ -55,6 +61,8 @@ interface FloorPlanProps {
   activeAlertId: string | null;
   onActiveAlertChange: (id: string | null) => void;
   onZoomChange: (zoom: number) => void;
+  /** 临时封控模式：点出口关闭、拖封控区域、点封控区域删除；此模式下展位不可拖动。 */
+  controlMode: boolean;
 }
 
 export function FloorPlan({
@@ -63,6 +71,7 @@ export function FloorPlan({
   activeAlertId,
   onActiveAlertChange,
   onZoomChange,
+  controlMode,
 }: FloorPlanProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [size, setSize] = useState({ w: 1000, h: 700 });
@@ -74,7 +83,7 @@ export function FloorPlan({
   sessionRef.current = session;
   const panMovedRef = useRef(false);
 
-  const { booths, analysis, selectedId } = planner;
+  const { booths, analysis, selectedId, closedExits, zones } = planner;
 
   /* ---------- 尺寸与适应窗口 ---------- */
   /** 画布容器（svg 的父节点 .canvas-wrap）。 */
@@ -208,6 +217,8 @@ export function FloorPlan({
   /* ---------- 指针会话 ---------- */
   const startBoothDrag = (e: React.PointerEvent, b: Booth) => {
     e.stopPropagation();
+    // 封控模式下展位锁定，只允许封控操作，避免误拖。
+    if (controlMode) return;
     (e.target as Element).setPointerCapture?.(e.pointerId);
     planner.selectBooth(b.id);
     const w = toWorld(e.clientX, e.clientY);
@@ -220,6 +231,7 @@ export function FloorPlan({
 
   const startResize = (e: React.PointerEvent, b: Booth, handle: HandleId) => {
     e.stopPropagation();
+    if (controlMode) return;
     (e.target as Element).setPointerCapture?.(e.pointerId);
     planner.selectBooth(b.id);
     setSession({
@@ -232,6 +244,12 @@ export function FloorPlan({
 
   const startPan = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    if (controlMode) {
+      // 封控模式：空白处按下开始拖封控区域。
+      const w = toWorld(e.clientX, e.clientY);
+      setSession({ type: 'zone', start: w, current: w });
+      return;
+    }
     setSession({
       type: 'pan',
       startPx: { x: e.clientX, y: e.clientY },
@@ -251,6 +269,12 @@ export function FloorPlan({
         const dy = e.clientY - s.startPx.y;
         if (Math.abs(dx) + Math.abs(dy) > 3) s.moved = true;
         setPan(clampPan({ x: s.startPan.x + dx, y: s.startPan.y + dy }, scale));
+        return;
+      }
+      if (s.type === 'zone') {
+        s.current = toWorld(e.clientX, e.clientY);
+        // 触发重绘（sessionRef 变化不自动渲染）。
+        setSession({ ...s });
         return;
       }
       const w = toWorld(e.clientX, e.clientY);
@@ -273,8 +297,23 @@ export function FloorPlan({
 
     const onUp = () => {
       const s = sessionRef.current;
-      if (s && s.type !== 'pan') planner.commitInteraction();
+      if (s && s.type !== 'pan' && s.type !== 'zone') planner.commitInteraction();
       if (s?.type === 'pan') panMovedRef.current = s.moved;
+      if (s?.type === 'zone') {
+        const x = Math.min(s.start.x, s.current.x);
+        const y = Math.min(s.start.y, s.current.y);
+        const w = Math.abs(s.current.x - s.start.x);
+        const h = Math.abs(s.current.y - s.start.y);
+        // 阈值过滤误触；addZone 内还会吸附并拒绝小于一格的区域。
+        if (w >= GRID_SIZE && h >= GRID_SIZE) {
+          planner.addZone({
+            x: Math.max(0, x),
+            y: Math.max(0, y),
+            w: Math.min(w, HALL_WIDTH - Math.max(0, x)),
+            h: Math.min(h, HALL_HEIGHT - Math.max(0, y)),
+          });
+        }
+      }
       setSession(null);
     };
 
@@ -288,6 +327,7 @@ export function FloorPlan({
 
   /* ---------- 双击添加 / 单击空白取消选中 ---------- */
   const onDoubleClick = (e: React.MouseEvent) => {
+    if (controlMode) return;
     const w = toWorld(e.clientX, e.clientY);
     if (w.x < 0 || w.y < 0 || w.x > HALL_WIDTH || w.y > HALL_HEIGHT) return;
     planner.addBoothAt(w.x, w.y);
@@ -334,7 +374,15 @@ export function FloorPlan({
     <>
       <svg
         ref={svgRef}
-        style={{ cursor: session?.type === 'pan' ? 'grabbing' : 'default' }}
+        style={{
+          cursor: session?.type === 'pan'
+            ? 'grabbing'
+            : session?.type === 'zone'
+              ? 'crosshair'
+              : controlMode
+                ? 'crosshair'
+                : 'default',
+        }}
       >
         <defs>
           <pattern
@@ -356,6 +404,17 @@ export function FloorPlan({
           >
             <rect width={0.22} height={0.22} fill="rgba(245,158,11,0.08)" />
             <line x1="0" y1="0" x2="0" y2={0.22} stroke="#d97706" strokeWidth={0.04} />
+          </pattern>
+          {/* 临时封控区域斜纹 */}
+          <pattern
+            id="hatch-control"
+            patternUnits="userSpaceOnUse"
+            width={0.3}
+            height={0.3}
+            patternTransform="rotate(45)"
+          >
+            <rect width={0.3} height={0.3} fill="rgba(180,83,9,0.16)" />
+            <line x1="0" y1="0" x2="0" y2={0.3} stroke="#b45309" strokeWidth={0.06} />
           </pattern>
           {/* 围挡砖纹 */}
           <pattern
@@ -397,27 +456,122 @@ export function FloorPlan({
 
           <Grid u={u} />
 
+          {/* 临时封控区域（路径下层、展位下层；封控模式下可点击删除） */}
+          {zones.map((z) => (
+            <g key={`zone-${z.id}`}>
+              <rect
+                x={z.x}
+                y={z.y}
+                width={z.w}
+                height={z.h}
+                fill="url(#hatch-control)"
+                stroke="#b45309"
+                strokeWidth={1.6 * u}
+                strokeDasharray={`${0.24} ${0.14}`}
+                pointerEvents={controlMode ? 'all' : 'none'}
+                style={{ cursor: controlMode ? 'pointer' : 'default' }}
+                onPointerDown={(e) => {
+                  // 不让事件冒泡到背景，避免在封控区上又拖出一个新封控区域。
+                  if (controlMode) e.stopPropagation();
+                }}
+                onClick={(e) => {
+                  if (!controlMode) return;
+                  e.stopPropagation();
+                  planner.removeZone(z.id);
+                }}
+              >
+                <title>临时封控区域（封控模式下点击删除）</title>
+              </rect>
+            </g>
+          ))}
+
+          {/* 正在拖出的封控区域预览 */}
+          {session?.type === 'zone' &&
+            (() => {
+              const r = rectFromPoints(session.start, session.current);
+              if (r.w < GRID_SIZE || r.h < GRID_SIZE) return null;
+              return (
+                <rect
+                  x={r.x}
+                  y={r.y}
+                  width={r.w}
+                  height={r.h}
+                  fill="rgba(180,83,9,0.14)"
+                  stroke="#b45309"
+                  strokeWidth={1.6 * u}
+                  strokeDasharray={`${0.24} ${0.14}`}
+                  pointerEvents="none"
+                />
+              );
+            })()}
+
           {/* 疏散路径（展位下层） */}
           {showPaths &&
             booths.map((b) => {
+              // 重点展位：画两条不相交路线（蓝/橙）；普通展位：绿色单路。
+              if (b.critical) {
+                const dual = analysis.dual[b.id];
+                if (!dual || dual.status === 'none') return null;
+                const strong = b.id === selectedId;
+                const baseOpacity = strong ? 0.95 : selectedId ? 0.2 : 0.55;
+                return (
+                  <g key={`path-${b.id}`} pointerEvents="none">
+                    <PathLine
+                      path={dual.paths[0]}
+                      u={u}
+                      strong={strong}
+                      opacity={baseOpacity}
+                      color="#1d4ed8"
+                    />
+                    {dual.status === 'dual' && (
+                      <PathLine
+                        path={dual.paths[1]}
+                        u={u}
+                        strong={strong}
+                        opacity={baseOpacity}
+                        color="#c2410c"
+                      />
+                    )}
+                  </g>
+                );
+              }
               const path = analysis.paths[b.id];
               if (!path || path.length < 2) return null;
               const strong = b.id === selectedId;
               return (
-                <polyline
+                <PathLine
                   key={`path-${b.id}`}
-                  points={path.map((p) => `${p.x},${p.y}`).join(' ')}
-                  fill="none"
-                  stroke="#15803d"
-                  strokeWidth={(strong ? 3.4 : 2) * u}
-                  strokeDasharray={`${0.28} ${0.2}`}
+                  path={path}
+                  u={u}
+                  strong={strong}
                   opacity={strong ? 0.95 : selectedId ? 0.18 : 0.4}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  pointerEvents="none"
+                  color="#15803d"
                 />
               );
             })}
+
+          {/* 重点展位双路状态徽标（地面投影） */}
+          {showPaths &&
+            booths
+              .filter((b) => b.critical)
+              .map((b) => {
+                const dual = analysis.dual[b.id];
+                if (!dual) return null;
+                const meta = DUAL_STATUS_META[dual.status];
+                return (
+                  <g
+                    key={`dual-badge-${b.id}`}
+                    pointerEvents="none"
+                    transform={`translate(${b.x + b.w + 0.12},${b.y - 0.12})`}
+                  >
+                    <circle cx={0.16} cy={0.16} r={0.17} fill={meta.color} stroke="#fff" strokeWidth={1.4 * u} />
+                    <text x={0.16} y={0.225} textAnchor="middle" fontSize={0.2} fill="#fff" fontWeight={700}>
+                      {meta.char}
+                    </text>
+                    <title>{meta.title}</title>
+                  </g>
+                );
+              })}
 
           {/* 重叠区域红斜纹 */}
           {overlapRegions.map((r, i) => (
@@ -435,7 +589,13 @@ export function FloorPlan({
           ))}
 
           {/* 墙体与出口 */}
-          <Walls u={u} blockedExitIds={analysis.blockedExitIds} />
+          <Walls
+            u={u}
+            blockedExitIds={analysis.blockedExitIds}
+            closedExitIds={closedExits}
+            controlMode={controlMode}
+            onToggleExit={planner.toggleExitClosed}
+          />
 
           {/* 展位 */}
           {booths.map((b) => (
@@ -481,8 +641,55 @@ export function FloorPlan({
   );
 }
 
-/* ================= 网格 ================= */
+/* ================= 路径与双路状态 ================= */
 
+const DUAL_STATUS_META: Record<
+  'dual' | 'single' | 'none',
+  { char: string; title: string; color: string }
+> = {
+  dual: { char: '双', title: '双路可用：两条路线不共用通行网格、通往不同出口', color: '#1d4ed8' },
+  single: { char: '单', title: '仅单路：只有一条疏散通道', color: '#b45309' },
+  none: { char: '断', title: '完全不可达', color: '#b91c1c' },
+};
+
+function PathLine({
+  path,
+  u,
+  strong,
+  opacity,
+  color,
+}: {
+  path: Point[];
+  u: number;
+  strong: boolean;
+  opacity: number;
+  color: string;
+}) {
+  if (!path || path.length < 2) return null;
+  return (
+    <polyline
+      points={path.map((p) => `${p.x},${p.y}`).join(' ')}
+      fill="none"
+      stroke={color}
+      strokeWidth={(strong ? 3.4 : 2.4) * u}
+      strokeDasharray={`${0.28} ${0.2}`}
+      opacity={opacity}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  );
+}
+
+function rectFromPoints(a: Point, b: Point): Rect {
+  return {
+    x: Math.min(a.x, b.x),
+    y: Math.min(a.y, b.y),
+    w: Math.abs(a.x - b.x),
+    h: Math.abs(a.y - b.y),
+  };
+}
+
+/* ================= 网格 ================= */
 function Grid({ u }: { u: number }) {
   const lines: React.ReactNode[] = [];
   for (let x = 0; x <= HALL_WIDTH / GRID_SIZE; x++) {
@@ -523,9 +730,15 @@ function Grid({ u }: { u: number }) {
 function Walls({
   u,
   blockedExitIds,
+  closedExitIds,
+  controlMode,
+  onToggleExit,
 }: {
   u: number;
   blockedExitIds: string[];
+  closedExitIds: string[];
+  controlMode: boolean;
+  onToggleExit: (id: string) => void;
 }) {
   const t = 0.22; // 墙厚（米）
   const wallColor = '#475569';
@@ -547,7 +760,9 @@ function Walls({
       ))}
 
       {EXITS.map((exitDef) => {
-        const blocked = blockedExitIds.includes(exitDef.id);
+        const physicallyBlocked = blockedExitIds.includes(exitDef.id);
+        const closed = closedExitIds.includes(exitDef.id);
+        const blocked = physicallyBlocked || closed;
         const horizontal = exitDef.wall === 'north' || exitDef.wall === 'south';
         const mid = (exitDef.start + exitDef.end) / 2;
         const len = exitDef.end - exitDef.start;
@@ -576,18 +791,57 @@ function Walls({
             ? HALL_HEIGHT + 0.78
             : -0.78
           : mid;
-        const color = blocked ? '#b91c1c' : '#15803d';
+        // 临时关闭用琥珀色，物理封堵用红色，正常绿色。
+        const color = blocked
+          ? closed && !physicallyBlocked
+            ? '#b45309'
+            : '#b91c1c'
+          : '#15803d';
+        const labelText = physicallyBlocked
+          ? '出口堵死'
+          : closed
+            ? '临时关闭'
+            : '安全出口';
+
+        const exitHit = controlMode ? (
+          <rect
+            x={horizontal ? x - 0.15 : x - 0.5}
+            y={horizontal ? y - 0.5 : y - 0.15}
+            width={horizontal ? len + 0.3 : 1.0}
+            height={horizontal ? 1.0 : len + 0.3}
+            fill="transparent"
+            style={{ cursor: 'pointer' }}
+            pointerEvents="all"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleExit(exitDef.id);
+            }}
+          >
+            <title>
+              {closed ? '点击重新开放该出口' : '点击临时关闭该出口'}
+            </title>
+          </rect>
+        ) : null;
 
         return (
           <g key={exitDef.id}>
-            {/* 出口内侧绿色/红色地带 */}
+            {exitHit}
+            {/* 出口内侧绿色/红色/琥珀色地带 */}
             {horizontal ? (
               <rect
                 x={x}
                 y={exitDef.wall === 'south' ? HALL_HEIGHT - inset : 0}
                 width={len}
                 height={inset}
-                fill={blocked ? 'rgba(185,28,28,0.22)' : 'rgba(21,128,61,0.18)'}
+                fill={
+                  blocked
+                    ? closed && !physicallyBlocked
+                      ? 'rgba(180,83,9,0.22)'
+                      : 'rgba(185,28,28,0.22)'
+                    : 'rgba(21,128,61,0.18)'
+                }
+                pointerEvents="none"
               />
             ) : (
               <rect
@@ -595,30 +849,63 @@ function Walls({
                 y={y}
                 width={inset}
                 height={len}
-                fill={blocked ? 'rgba(185,28,28,0.22)' : 'rgba(21,128,61,0.18)'}
+                fill={
+                  blocked
+                    ? closed && !physicallyBlocked
+                      ? 'rgba(180,83,9,0.22)'
+                      : 'rgba(185,28,28,0.22)'
+                    : 'rgba(21,128,61,0.18)'
+                }
+                pointerEvents="none"
               />
             )}
             {/* 出口边框 */}
             {horizontal ? (
               <>
-                <line x1={x} y1={exitDef.wall === 'south' ? HALL_HEIGHT : 0} x2={x} y2={(exitDef.wall === 'south' ? HALL_HEIGHT : 0) + (exitDef.wall === 'south' ? -inset : inset)} stroke={color} strokeWidth={2.4 * u} />
-                <line x1={x + len} y1={exitDef.wall === 'south' ? HALL_HEIGHT : 0} x2={x + len} y2={(exitDef.wall === 'south' ? HALL_HEIGHT : 0) + (exitDef.wall === 'south' ? -inset : inset)} stroke={color} strokeWidth={2.4 * u} />
+                <line x1={x} y1={exitDef.wall === 'south' ? HALL_HEIGHT : 0} x2={x} y2={(exitDef.wall === 'south' ? HALL_HEIGHT : 0) + (exitDef.wall === 'south' ? -inset : inset)} stroke={color} strokeWidth={2.4 * u} pointerEvents="none" />
+                <line x1={x + len} y1={exitDef.wall === 'south' ? HALL_HEIGHT : 0} x2={x + len} y2={(exitDef.wall === 'south' ? HALL_HEIGHT : 0) + (exitDef.wall === 'south' ? -inset : inset)} stroke={color} strokeWidth={2.4 * u} pointerEvents="none" />
               </>
             ) : (
               <>
-                <line x1={exitDef.wall === 'east' ? HALL_WIDTH : 0} y1={y} x2={(exitDef.wall === 'east' ? HALL_WIDTH : 0) + (exitDef.wall === 'east' ? -inset : inset)} y2={y} stroke={color} strokeWidth={2.4 * u} />
-                <line x1={exitDef.wall === 'east' ? HALL_WIDTH : 0} y1={y + len} x2={(exitDef.wall === 'east' ? HALL_WIDTH : 0) + (exitDef.wall === 'east' ? -inset : inset)} y2={y + len} stroke={color} strokeWidth={2.4 * u} />
+                <line x1={exitDef.wall === 'east' ? HALL_WIDTH : 0} y1={y} x2={(exitDef.wall === 'east' ? HALL_WIDTH : 0) + (exitDef.wall === 'east' ? -inset : inset)} y2={y} stroke={color} strokeWidth={2.4 * u} pointerEvents="none" />
+                <line x1={exitDef.wall === 'east' ? HALL_WIDTH : 0} y1={y + len} x2={(exitDef.wall === 'east' ? HALL_WIDTH : 0) + (exitDef.wall === 'east' ? -inset : inset)} y2={y + len} stroke={color} strokeWidth={2.4 * u} pointerEvents="none" />
               </>
             )}
+            {/* 临时关闭：画路障横杠 */}
+            {closed && !physicallyBlocked && (
+              <g pointerEvents="none">
+                {horizontal ? (
+                  <line
+                    x1={x + 0.15}
+                    y1={exitDef.wall === 'south' ? HALL_HEIGHT - 0.05 : 0.05}
+                    x2={x + len - 0.15}
+                    y2={exitDef.wall === 'south' ? HALL_HEIGHT - 0.05 : 0.05}
+                    stroke="#b45309"
+                    strokeWidth={4.5 * u}
+                    strokeLinecap="round"
+                  />
+                ) : (
+                  <line
+                    x1={exitDef.wall === 'east' ? HALL_WIDTH - 0.05 : 0.05}
+                    y1={y + 0.15}
+                    x2={exitDef.wall === 'east' ? HALL_WIDTH - 0.05 : 0.05}
+                    y2={y + len - 0.15}
+                    stroke="#b45309"
+                    strokeWidth={4.5 * u}
+                    strokeLinecap="round"
+                  />
+                )}
+              </g>
+            )}
             {/* 标签底板 */}
-            <g>
+            <g pointerEvents="none">
               <rect
                 x={labelX - 0.62}
                 y={labelY - 0.2}
                 width={1.24}
                 height={0.4}
                 rx={0.06}
-                fill={blocked ? '#b91c1c' : '#15803d'}
+                fill={color}
               />
               <text
                 x={labelX}
@@ -628,11 +915,11 @@ function Walls({
                 fill="#fff"
                 fontWeight={700}
               >
-                {blocked ? '出口堵死' : '安全出口'}
+                {labelText}
               </text>
             </g>
-            {blocked && (
-              <g className="exit-cross">
+            {physicallyBlocked && (
+              <g className="exit-cross" pointerEvents="none">
                 {/* 红叉画在墙外一侧 */}
                 {horizontal ? (
                   <>
@@ -684,7 +971,7 @@ function Walls({
       })}
 
       {/* 大厅总尺寸标注 */}
-      <text x={HALL_WIDTH / 2} y={-0.55} textAnchor="middle" fontSize={0.3} fill="#64748b">
+      <text x={HALL_WIDTH / 2} y={-0.55} textAnchor="middle" fontSize={0.3} fill="#64748b" pointerEvents="none">
         展厅 20 m
       </text>
       <text
@@ -694,6 +981,7 @@ function Walls({
         fontSize={0.3}
         fill="#64748b"
         transform={`rotate(-90 ${-0.75} ${HALL_HEIGHT / 2})`}
+        pointerEvents="none"
       >
         14 m
       </text>
@@ -736,7 +1024,9 @@ const KIND_STYLE: Record<
   'out-of-bounds': { color: '#b91c1c', char: '界', title: '越界' },
   clearance: { color: '#b45309', char: '距', title: '净空不足' },
   'exit-blocked': { color: '#b91c1c', char: '封', title: '封住出口' },
-  'no-path': { color: '#6d28d9', char: '堵', title: '疏散不可达' },
+  'exit-closed': { color: '#b45309', char: '关', title: '出口临时关闭' },
+  'no-path': { color: '#6d28d9', char: '断', title: '疏散不可达' },
+  'single-route': { color: '#b45309', char: '单', title: '重点展位仅单路' },
 };
 
 interface BoothViewProps {

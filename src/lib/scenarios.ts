@@ -8,6 +8,12 @@
  *   2) B09 紧贴南墙，整体盖住南出口（x 3~5 m），南出口被封，
  *      所有疏散路径只能绕去北出口；把 B09 拖开后路径重新分流。
  * 正常展位之间均预留 ≥1.5 m 净宽，告警只来自上面两处刻意设计。
+ *
+ * - dualRouteScenario：重点展位“双通道”演练示例
+ *   C01（重点展位）位于一座围挡小院内，南墙只开 1 号门，2 号门被可拖走的
+ *   “挡墙-二门”临时堵死——两条疏散路线必须在 1 号门汇合，只有单路；
+ *   拖走“挡墙-二门”后，1 号门绕东去北出口、2 号门绕西去南出口，双路可用；
+ *   封控模式下关闭南出口，双路降级为单路（出口关闭），撤销后恢复双路。
  */
 import type { Booth, PlanState } from '../types';
 import { nextId } from './id';
@@ -35,6 +41,7 @@ export interface BoothSeed {
   orientation?: Booth['orientation'];
   color?: string;
   kind?: 'booth' | 'partition';
+  critical?: boolean;
 }
 
 function makeBooths(seeds: BoothSeed[]): Booth[] {
@@ -48,11 +55,12 @@ function makeBooths(seeds: BoothSeed[]): Booth[] {
     label: s.label,
     color: s.color ?? PALETTE[i % PALETTE.length],
     kind: s.kind ?? 'booth',
+    critical: s.critical ?? false,
   }));
 }
 
 export function emptyPlan(): PlanState {
-  return { booths: [] };
+  return { booths: [], closedExits: [], zones: [] };
 }
 
 export function blockedExitScenario(): PlanState {
@@ -98,5 +106,50 @@ export function newBoothAt(x: number, y: number, index: number): Booth {
     label: `B${String(index + 1).padStart(2, '0')}`,
     color: PALETTE[index % PALETTE.length],
     kind: 'booth',
+    critical: false,
+  };
+}
+
+/**
+ * 重点展位双通道演练示例。
+ * 围挡小院（外墙 7~13.5 × 3.5~10.5）的东、西墙各留一道严格 0.5 m（一个网格）的门：
+ * - 初始“挡墙-二门”堵住东门，C01 出院只能走西门这一个格，双路被迫共用 -> 仅单路（瓶颈）；
+ * - 把“挡墙-二门”拖到南墙外（或播放演练自动移走）-> 两门各奔一个出口 -> 双路可用；
+ * - 封控模式关闭南出口 -> 只剩北出口 -> 降级单路（出口关闭），撤销恢复双路。
+ * 普通展位与围挡净宽均 ≥1.5 m，除 C01 的单路告警外无其他告警。
+ */
+export function dualRouteScenario(): PlanState {
+  return {
+    booths: makeBooths([
+      // —— 小院北墙、南墙 ——
+      { x: 7, y: 3.5, w: 6.5, h: 0.5, label: '围挡-院北', color: '#8d6e63', kind: 'partition' },
+      { x: 7, y: 10, w: 6.5, h: 0.5, label: '围挡-院南', color: '#8d6e63', kind: 'partition' },
+      // —— 西墙：y6.5~7.0 留严格一格的 1 号门（上段止于 6.5，下段起于 7.0）——
+      { x: 7, y: 3.5, w: 0.5, h: 3, label: '围挡-西墙', color: '#8d6e63', kind: 'partition' },
+      { x: 7, y: 7, w: 0.5, h: 3.5, label: '围挡-西墙2', color: '#8d6e63', kind: 'partition' },
+      // —— 东墙：同位置留 2 号门，初始由“挡墙-二门”（恰好一格）堵死 ——
+      { x: 13, y: 3.5, w: 0.5, h: 3, label: '围挡-东墙', color: '#8d6e63', kind: 'partition' },
+      { x: 13, y: 7, w: 0.5, h: 3.5, label: '围挡-东墙2', color: '#8d6e63', kind: 'partition' },
+      { x: 13, y: 6.5, w: 0.5, h: 0.5, label: '挡墙-二门', color: '#a0522d', kind: 'partition' },
+      // —— 重点展位（院内居中，与各墙净宽 ≥1.5 m）——
+      { x: 9, y: 5.5, w: 2.5, h: 2, label: 'C01', orientation: 'south', color: '#c2410c', critical: true },
+      // —— 院外普通展位 ——
+      { x: 1.5, y: 1, w: 3, h: 2, label: 'D02', orientation: 'south' },
+      { x: 16, y: 1.5, w: 3, h: 2, label: 'D03', orientation: 'west' },
+      { x: 15.5, y: 9, w: 2.5, h: 2, label: 'D04', orientation: 'north' },
+      { x: 1, y: 11, w: 2.5, h: 2, label: 'D05', orientation: 'east' },
+    ]),
+    closedExits: [],
+    zones: [],
+  };
+}
+
+/** 演练中把“挡墙-二门”移到院外南侧（释放 2 号门）后的方案。 */
+export function withGateOpened(plan: PlanState): PlanState {
+  return {
+    ...plan,
+    booths: plan.booths.map((b) =>
+      b.label === '挡墙-二门' ? { ...b, x: 13, y: 12 } : b,
+    ),
   };
 }

@@ -1,9 +1,9 @@
 /**
  * 疏散可达性：在展厅 0.5 m 网格上做 BFS。
- * 展位 footprint 为障碍（边相不算阻挡，允许贴边通行），
+ * 展位 footprint 与临时封控区域为障碍（边相不算阻挡，允许贴边通行），
  * 从展位正面接待点出发，4 邻接（不斜穿对角），到达任一出口目标点即成功。
  */
-import type { Booth, ExitDef, Point } from '../types';
+import type { Booth, ControlZone, ExitDef, Point } from '../types';
 import {
   EXITS,
   HALL_HEIGHT,
@@ -76,72 +76,84 @@ export function isBlockedCell(
   return false;
 }
 
-function nearestCell(p: Point, g: number): { cx: number; cy: number } {
+export function nearestCell(p: Point, g: number): { cx: number; cy: number } {
   return {
     cx: Math.round((p.x - g / 2) / g),
     cy: Math.round((p.y - g / 2) / g),
   };
 }
 
-/**
- * 从 start 寻路到任一出口。
- * @param booths 当前全部展位（障碍）
- * @param start 起点（通常是展位接待点）
- */
-export function findExitPath(
+/** 单元索引 -> 单元中心米坐标。 */
+export function cellCenter(idx: number, cols: number, g: number): Point {
+  return {
+    x: (idx % cols) * g + g / 2,
+    y: Math.floor(idx / cols) * g + g / 2,
+  };
+}
+
+/** 可通行网格模型：booths + 临时封控区域共同构成障碍位图。 */
+export interface GridModel {
+  cols: number;
+  rows: number;
+  g: number;
+  blocked: Uint8Array;
+  blockedCellCount: number;
+}
+
+export function buildGrid(
   booths: Booth[],
-  start: Point,
-  exits = EXITS,
+  zones: ControlZone[] = [],
   g: number = PATH_GRID,
-): PathResult {
+): GridModel {
   const cols = Math.round(HALL_WIDTH / g);
   const rows = Math.round(HALL_HEIGHT / g);
-
-  // 预计算障碍位图（展位越界部分自然落在网格外，不影响室内单元）。
   const blocked = new Uint8Array(cols * rows);
   let blockedCellCount = 0;
   for (let cy = 0; cy < rows; cy++) {
     for (let cx = 0; cx < cols; cx++) {
-      if (isBlockedCell(cx, cy, booths, cols, rows, g)) {
+      const cell = cellRect(cx, cy, g);
+      let occupied = false;
+      for (const b of booths) {
+        if (rectsTouchIntersect(cell, rectOf(b))) {
+          occupied = true;
+          break;
+        }
+      }
+      if (!occupied) {
+        for (const z of zones) {
+          if (rectsTouchIntersect(cell, z)) {
+            occupied = true;
+            break;
+          }
+        }
+      }
+      if (occupied) {
         blocked[cy * cols + cx] = 1;
         blockedCellCount++;
       }
     }
   }
+  return { cols, rows, g, blocked, blockedCellCount };
+}
 
-  const s = nearestCell(start, g);
-  // 起点被堵（例如正面紧贴另一展位）时，先尝试在 1 格范围内找最近的可行走单元。
-  let startCell = s;
-  if (isBlockedCell(s.cx, s.cy, booths, cols, rows, g)) {
-    const alt = nearestFreeNeighbor(s.cx, s.cy, blocked, cols, rows);
-    if (!alt) {
-      return { reachable: false, path: [], blockedCellCount };
-    }
-    startCell = alt;
-  }
+const NEIGHBORS = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1],
+];
 
-  const targets = new Set<number>();
-  for (const t of exitTargetPoints(exits)) {
-    const c = nearestCell(t, g);
-    if (c.cx >= 0 && c.cx < cols && c.cy >= 0 && c.cy < rows) {
-      targets.add(c.cy * cols + c.cx);
-    }
-  }
-
-  // BFS
+/** 在网格上从起点单元 BFS 到任一目标单元；返回单元索引路径。 */
+export function bfsCells(
+  grid: GridModel,
+  startIdx: number,
+  targets: Set<number>,
+): { reachable: boolean; goalIdx: number; cells: number[] } {
+  const { cols, rows, blocked } = grid;
   const prev = new Int32Array(cols * rows).fill(-1);
   const seen = new Uint8Array(cols * rows);
-  const queue: number[] = [];
-  const startIdx = startCell.cy * cols + startCell.cx;
+  const queue: number[] = [startIdx];
   seen[startIdx] = 1;
-  queue.push(startIdx);
-
-  const NEIGHBORS = [
-    [1, 0],
-    [-1, 0],
-    [0, 1],
-    [0, -1],
-  ];
 
   let goalIdx = -1;
   while (queue.length) {
@@ -164,11 +176,8 @@ export function findExitPath(
     }
   }
 
-  if (goalIdx === -1) {
-    return { reachable: false, path: [], blockedCellCount };
-  }
+  if (goalIdx === -1) return { reachable: false, goalIdx: -1, cells: [] };
 
-  // 回溯路径并转为米坐标（单元中心）。
   const cells: number[] = [];
   let cur = goalIdx;
   while (cur !== -1) {
@@ -177,14 +186,83 @@ export function findExitPath(
     cur = prev[cur];
   }
   cells.reverse();
-  const path: Point[] = cells.map((idx) => ({
-    x: (idx % cols) * g + g / 2,
-    y: Math.floor(idx / cols) * g + g / 2,
-  }));
+  return { reachable: true, goalIdx, cells };
+}
+
+/** 解析可行走起点：起点被堵时在 1~2 格范围内找最近的空闲单元。 */
+export function resolveStartCell(
+  start: Point,
+  grid: GridModel,
+): { idx: number } | null {
+  const s = nearestCell(start, grid.g);
+  const { cols, rows, blocked } = grid;
+  if (
+    s.cx >= 0 &&
+    s.cy >= 0 &&
+    s.cx < cols &&
+    s.cy < rows &&
+    !blocked[s.cy * cols + s.cx]
+  ) {
+    return { idx: s.cy * cols + s.cx };
+  }
+  const alt = nearestFreeNeighbor(s.cx, s.cy, blocked, cols, rows);
+  return alt ? { idx: alt.cy * cols + alt.cx } : null;
+}
+
+/** 出口开口内侧目标单元集合（去重）。 */
+export function exitTargetCellMap(
+  exits: ExitDef[],
+  cols: number,
+  rows: number,
+  g: number,
+): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const exitDef of exits) {
+    for (const t of exitTargetPoints([exitDef])) {
+      const c = nearestCell(t, g);
+      if (c.cx >= 0 && c.cx < cols && c.cy >= 0 && c.cy < rows) {
+        const idx = c.cy * cols + c.cx;
+        if (!map.has(idx)) map.set(idx, exitDef.id);
+      }
+    }
+  }
+  return map;
+}
+
+/**
+ * 从 start 寻路到任一出口。
+ * @param booths 当前全部展位（障碍）
+ * @param start 起点（通常是展位接待点）
+ * @param exits 可用出口（默认全部；封控时传入未关闭出口）
+ * @param zones 临时封控区域（障碍）
+ */
+export function findExitPath(
+  booths: Booth[],
+  start: Point,
+  exits: ExitDef[] = EXITS,
+  g: number = PATH_GRID,
+  zones: ControlZone[] = [],
+): PathResult {
+  const grid = buildGrid(booths, zones, g);
+
+  const startCell = resolveStartCell(start, grid);
+  if (!startCell) {
+    return { reachable: false, path: [], blockedCellCount: grid.blockedCellCount };
+  }
+
+  const targetMap = exitTargetCellMap(exits, grid.cols, grid.rows, g);
+  const result = bfsCells(grid, startCell.idx, new Set(targetMap.keys()));
+  if (!result.reachable) {
+    return { reachable: false, path: [], blockedCellCount: grid.blockedCellCount };
+  }
+
+  const path: Point[] = result.cells.map((idx) =>
+    cellCenter(idx, grid.cols, g),
+  );
   // 首点用真实接待点，路径从展位正面出发而不是格子中心。
   path[0] = start;
 
-  return { reachable: true, path, blockedCellCount };
+  return { reachable: true, path, blockedCellCount: grid.blockedCellCount };
 }
 
 function nearestFreeNeighbor(

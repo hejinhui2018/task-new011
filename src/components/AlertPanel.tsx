@@ -1,24 +1,35 @@
-import type { Alert } from '../types';
+import type { Alert, RouteReason } from '../types';
 
 const KIND_META: Record<
   Alert['kind'],
   { char: string; title: string; cls: string }
 > = {
   'exit-blocked': { char: '封', title: '出口被堵', cls: 'kind-exit-blocked' },
+  'exit-closed': { char: '关', title: '出口临时关闭', cls: 'kind-exit-closed' },
   overlap: { char: '重', title: '展位重叠', cls: 'kind-overlap' },
   'out-of-bounds': { char: '界', title: '超出展厅', cls: 'kind-out-of-bounds' },
   clearance: { char: '距', title: '通道过窄', cls: 'kind-clearance' },
-  'no-path': { char: '堵', title: '疏散不可达', cls: 'kind-no-path' },
+  'no-path': { char: '断', title: '疏散不可达', cls: 'kind-no-path' },
+  'single-route': { char: '单', title: '重点展位仅单路', cls: 'kind-single-route' },
 };
 
-// 严重度排序：出口封堵 > 重叠/越界 > 不可达 > 净空
+// 严重度排序：出口封堵/关闭 > 重叠/越界 > 完全不可达 > 仅单路 > 净空
 const ORDER: Alert['kind'][] = [
   'exit-blocked',
+  'exit-closed',
   'overlap',
   'out-of-bounds',
   'no-path',
+  'single-route',
   'clearance',
 ];
+
+/** 双路告警原因的中文标签（选中告警时可看到是出口关闭、空间瓶颈还是完全断路）。 */
+export const REASON_TEXT: Record<RouteReason, string> = {
+  'exit-closed': '原因：出口关闭/被封堵',
+  bottleneck: '原因：空间瓶颈（两条疏散线被迫共用通道）',
+  disconnected: '原因：完全断路（接待点到不了任何开放出口）',
+};
 
 interface AlertPanelProps {
   alerts: Alert[];
@@ -63,6 +74,9 @@ export function AlertPanel({ alerts, activeAlertId, onSelect }: AlertPanelProps)
                   <span className="msg" style={{ display: 'block' }}>
                     {a.message}
                   </span>
+                  {a.reason && (
+                    <span className="reason-tag">{REASON_TEXT[a.reason]}</span>
+                  )}
                 </span>
               </button>
             );

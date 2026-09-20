@@ -4,9 +4,17 @@ interface ToolbarProps {
   onUndo: () => void;
   onRedo: () => void;
   onAddBooth: () => void;
-  onReset: (target: 'empty' | 'blocked-exit') => void;
+  onReset: (target: 'empty' | 'blocked-exit' | 'dual-route') => void;
   showPaths: boolean;
   onTogglePaths: () => void;
+  /** 临时封控模式开关 */
+  controlMode: boolean;
+  onToggleControlMode: () => void;
+  onClearControls: () => void;
+  hasControls: boolean;
+  /** 播放 90 秒双通道演练 */
+  onPlayDemo: () => void;
+  demoPlaying: boolean;
 }
 
 export function Toolbar({
@@ -18,17 +26,23 @@ export function Toolbar({
   onReset,
   showPaths,
   onTogglePaths,
+  controlMode,
+  onToggleControlMode,
+  onClearControls,
+  hasControls,
+  onPlayDemo,
+  demoPlaying,
 }: ToolbarProps) {
   return (
     <header className="toolbar">
       <div className="brand">
         <span className="logo">展</span>
-        <span>展位排布工作台</span>
+        <span>VenueFlow 展位排布工作台</span>
         <small>20 × 14 m 展厅 · 0.5 m 网格</small>
       </div>
 
       <div className="tb-group">
-        <button className="tb primary" onClick={onAddBooth}>
+        <button className="tb primary" onClick={onAddBooth} disabled={controlMode}>
           ＋ 添加展位
         </button>
       </div>
@@ -44,18 +58,51 @@ export function Toolbar({
 
       <div className="tb-group">
         <button
+          className={controlMode ? 'tb control-on' : 'tb'}
+          onClick={onToggleControlMode}
+          title="进入/退出临时封控模式：点击出口关闭，在空白处拖出封控区域，点击封控区域删除"
+        >
+          {controlMode ? '🚧 退出封控' : '🚧 临时封控'}
+        </button>
+        <button
+          className="tb"
+          onClick={onClearControls}
+          disabled={!hasControls}
+          title="撤销全部出口关闭与封控区域"
+        >
+          清除封控
+        </button>
+        <button
           className="tb"
           onClick={onTogglePaths}
           title="显示/隐藏疏散路径"
         >
-          {showPaths ? '🚧 隐藏路径' : '🚶 显示路径'}
+          {showPaths ? '隐藏路径' : '显示路径'}
+        </button>
+      </div>
+
+      <div className="tb-group">
+        <button
+          className="tb demo-btn"
+          onClick={onPlayDemo}
+          disabled={demoPlaying}
+          title="播放约 40 秒的双通道演练：单路 → 双路 → 关闭出口降级 → 撤销恢复"
+        >
+          ▶ 双通道演练
+        </button>
+        <button
+          className="tb"
+          onClick={() => onReset('dual-route')}
+          title="载入重点展位双通道示例方案"
+        >
+          双通道示例
         </button>
         <button
           className="tb"
           onClick={() => onReset('blocked-exit')}
           title="载入内置的出口被堵示例方案"
         >
-          载入“出口被堵”示例
+          “出口被堵”示例
         </button>
         <button
           className="tb danger-text"

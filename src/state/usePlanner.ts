@@ -3,26 +3,46 @@
  * 拖拽过程中用 liveUpdateBooth 实时刷新画面（不入历史），松手时 commit 一次，
  * 保证一次拖动 = 一条撤销记录。
  *
+ * 重点展位标记、出口封控、封控区域等离散操作同样走 commitNow，
+ * 因此撤销/重做/恢复示例后，双路状态与告警作为派生数据始终与快照一致。
+ *
  * 注意：所有对外部可变 History 的读写都在事件处理中基于 planRef 完成，
  * 不放进 setState 的 updater 内（StrictMode 会双调用 updater）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Booth, PlanState } from '../types';
+import type { Booth, ControlZone, PlanState } from '../types';
 import { History } from '../lib/history';
 import { analyzePlan } from '../lib/validation';
-import { blockedExitScenario, emptyPlan, newBoothAt } from '../lib/scenarios';
+import {
+  blockedExitScenario,
+  dualRouteScenario,
+  emptyPlan,
+  newBoothAt,
+} from '../lib/scenarios';
 import { loadPlan, savePlan } from '../lib/persistence';
 import { GRID_SIZE } from '../constants';
 import { snapToGrid } from '../lib/grid';
 import { rotate90 } from '../lib/geometry';
+import { nextId } from '../lib/id';
 
 function planEquals(a: PlanState, b: PlanState): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function initialPlan(): PlanState {
-  return loadPlan() ?? blockedExitScenario();
+/** 补齐可选的封控字段（内置示例与旧快照可能缺省）。 */
+export function normalizePlan(p: PlanState): PlanState {
+  return {
+    booths: p.booths,
+    closedExits: p.closedExits ?? [],
+    zones: p.zones ?? [],
+  };
 }
+
+function initialPlan(): PlanState {
+  return normalizePlan(loadPlan() ?? blockedExitScenario());
+}
+
+export type ResetTarget = 'empty' | 'blocked-exit' | 'dual-route';
 
 export function usePlanner() {
   const [plan, setPlanState] = useState<PlanState>(initialPlan);
@@ -40,8 +60,9 @@ export function usePlanner() {
 
   /** 统一的状态写入：同步更新 ref，供事件处理中立即读到最新值。 */
   const applyPlan = useCallback((next: PlanState) => {
-    planRef.current = next;
-    setPlanState(next);
+    const normalized = normalizePlan(next);
+    planRef.current = normalized;
+    setPlanState(normalized);
   }, []);
 
   // 持久化
@@ -49,11 +70,19 @@ export function usePlanner() {
     savePlan(plan);
   }, [plan]);
 
-  const analysis = useMemo(() => analyzePlan(plan.booths), [plan.booths]);
+  const analysis = useMemo(
+    () =>
+      analyzePlan(plan.booths, {
+        closedExits: plan.closedExits ?? [],
+        zones: plan.zones ?? [],
+      }),
+    [plan],
+  );
 
   const replaceBooth = useCallback(
     (id: string, patch: Partial<Booth>) => {
       const next: PlanState = {
+        ...planRef.current,
         booths: planRef.current.booths.map((b) =>
           b.id === id ? { ...b, ...patch } : b,
         ),
@@ -73,7 +102,7 @@ export function usePlanner() {
     bumpHistory();
   }, [history, applyPlan]);
 
-  /** 离散操作（旋转、删除、改参数）立即提交一条历史。 */
+  /** 离散操作（旋转、删除、改参数、标记/封控）立即提交一条历史。 */
   const commitNow = useCallback(
     (updater: (prev: PlanState) => PlanState) => {
       applyPlan(history.commit(updater(planRef.current)));
@@ -91,7 +120,7 @@ export function usePlanner() {
       snapToGrid(1 + (index % 8) * GRID_SIZE),
       index,
     );
-    commitNow(() => ({ booths: [...prev.booths, booth] }));
+    commitNow(() => ({ ...prev, booths: [...prev.booths, booth] }));
     setSelectedId(booth.id);
   }, [commitNow]);
 
@@ -105,7 +134,7 @@ export function usePlanner() {
         snapToGrid(y - 1, GRID_SIZE),
         index,
       );
-      commitNow(() => ({ booths: [...prev.booths, booth] }));
+      commitNow(() => ({ ...prev, booths: [...prev.booths, booth] }));
       setSelectedId(booth.id);
     },
     [commitNow],
@@ -114,6 +143,7 @@ export function usePlanner() {
   const rotateBooth = useCallback(
     (id: string) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.map((b) => (b.id === id ? rotate90(b) : b)),
       }));
     },
@@ -124,10 +154,26 @@ export function usePlanner() {
     if (selectedId) rotateBooth(selectedId);
   }, [rotateBooth, selectedId]);
 
+  /** 重点展位标记切换（普通展位 ⇄ 双通道演练展位）。 */
+  const toggleCritical = useCallback(
+    (id: string) => {
+      commitNow((prev) => ({
+        ...prev,
+        booths: prev.booths.map((b) =>
+          b.id === id && b.kind !== 'partition'
+            ? { ...b, critical: !b.critical }
+            : b,
+        ),
+      }));
+    },
+    [commitNow],
+  );
+
   /** 检查器：修改朝向（不交换宽高）。 */
   const setOrientation = useCallback(
     (id: string, orientation: Booth['orientation']) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.map((b) =>
           b.id === id ? { ...b, orientation } : b,
         ),
@@ -144,6 +190,7 @@ export function usePlanner() {
       value: string | number,
     ) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.map((b) => {
           if (b.id !== id) return b;
           if (field === 'label') return { ...b, label: String(value) };
@@ -158,6 +205,7 @@ export function usePlanner() {
   const deleteBooth = useCallback(
     (id: string) => {
       commitNow((prev) => ({
+        ...prev,
         booths: prev.booths.filter((b) => b.id !== id),
       }));
       setSelectedId((cur) => (cur === id ? null : cur));
@@ -168,6 +216,59 @@ export function usePlanner() {
   const deleteSelected = useCallback(() => {
     if (selectedId) deleteBooth(selectedId);
   }, [deleteBooth, selectedId]);
+
+  /* ---------- 临时封控 ---------- */
+
+  /** 切换某出口的临时关闭状态。 */
+  const toggleExitClosed = useCallback(
+    (exitId: string) => {
+      commitNow((prev) => {
+        const closed = prev.closedExits ?? [];
+        return {
+          ...prev,
+          closedExits: closed.includes(exitId)
+            ? closed.filter((id) => id !== exitId)
+            : [...closed, exitId],
+        };
+      });
+    },
+    [commitNow],
+  );
+
+  /** 拖出一个临时封控区域（坐标已吸附、尺寸 ≥0.5 m），作为一条历史。 */
+  const addZone = useCallback(
+    (zone: Omit<ControlZone, 'id'>) => {
+      const normalized = {
+        x: snapToGrid(zone.x),
+        y: snapToGrid(zone.y),
+        w: snapToGrid(zone.w),
+        h: snapToGrid(zone.h),
+      };
+      if (normalized.w < GRID_SIZE || normalized.h < GRID_SIZE) return;
+      const item: ControlZone = { id: nextId('zone'), ...normalized };
+      commitNow((prev) => ({
+        ...prev,
+        zones: [...(prev.zones ?? []), item],
+      }));
+    },
+    [commitNow],
+  );
+
+  /** 删除一个临时封控区域（封控模式下点击区域）。 */
+  const removeZone = useCallback(
+    (zoneId: string) => {
+      commitNow((prev) => ({
+        ...prev,
+        zones: (prev.zones ?? []).filter((z) => z.id !== zoneId),
+      }));
+    },
+    [commitNow],
+  );
+
+  /** 清空全部临时封控（关闭出口 + 封控区域）。 */
+  const clearControls = useCallback(() => {
+    commitNow((prev) => ({ ...prev, closedExits: [], zones: [] }));
+  }, [commitNow]);
 
   const undo = useCallback(() => {
     applyPlan(history.undo());
@@ -180,10 +281,15 @@ export function usePlanner() {
   }, [history, applyPlan]);
 
   const resetPlan = useCallback(
-    (target: 'empty' | 'blocked-exit' = 'empty') => {
-      const next = target === 'empty' ? emptyPlan() : blockedExitScenario();
+    (target: ResetTarget = 'empty') => {
+      const next =
+        target === 'empty'
+          ? emptyPlan()
+          : target === 'dual-route'
+            ? dualRouteScenario()
+            : blockedExitScenario();
       // 作为一条历史提交，重置/载入示例后可用 Ctrl+Z 恢复原方案
-      applyPlan(history.commit(next));
+      applyPlan(history.commit(normalizePlan(next)));
       setSelectedId(null);
       bumpHistory();
     },
@@ -230,6 +336,7 @@ export function usePlanner() {
               : 0;
         if (dx || dy) {
           commitNow((prev) => ({
+            ...prev,
             booths: prev.booths.map((b) =>
               b.id === id
                 ? {
@@ -249,6 +356,8 @@ export function usePlanner() {
 
   return {
     booths: plan.booths,
+    closedExits: plan.closedExits ?? [],
+    zones: plan.zones ?? [],
     selectedId,
     analysis,
     selectBooth: setSelectedId,
@@ -262,8 +371,13 @@ export function usePlanner() {
     rotateBooth,
     setOrientation,
     updateBoothField,
+    toggleCritical,
     deleteBooth,
     deleteSelected,
+    toggleExitClosed,
+    addZone,
+    removeZone,
+    clearControls,
     undo,
     redo,
     canUndo: history.canUndo,
